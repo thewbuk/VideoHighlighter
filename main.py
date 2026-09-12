@@ -1021,6 +1021,33 @@ class VideoHighlighterGUI(QWidget):
         self.update_banner = self._build_update_banner()
         layout.addWidget(self.update_banner)
 
+        # --- Mode switch: Video | Photos ---
+        # The two halves of the app have nothing in common — different inputs,
+        # different outputs, different controls — so they get the whole window
+        # in turn rather than competing for one crowded layout. Everything the
+        # video side owns is registered in self._video_only_widgets below and
+        # hidden wholesale when Photos is showing.
+        self.mode_bar = QWidget()
+        mode_layout = QHBoxLayout(self.mode_bar)
+        mode_layout.setContentsMargins(0, 0, 0, 2)
+        mode_layout.setSpacing(6)
+        self.mode_video_btn = QPushButton("🎬  Video")
+        self.mode_photo_btn = QPushButton("🖼️  Photos")
+        for b in (self.mode_video_btn, self.mode_photo_btn):
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setMinimumHeight(30)
+            mode_layout.addWidget(b)
+        self.mode_video_btn.setChecked(True)
+        self.mode_video_btn.clicked.connect(lambda: self.set_mode("video"))
+        self.mode_photo_btn.clicked.connect(lambda: self.set_mode("photo"))
+        mode_layout.addStretch()
+        layout.addWidget(self.mode_bar)
+
+        # Populated as the video UI is built; see set_mode().
+        self._video_only_widgets = []
+        self._video_only_layouts = []
+
         # Store video duration
         self.current_video_duration = 0
 
@@ -1064,6 +1091,7 @@ class VideoHighlighterGUI(QWidget):
         # into a tall mostly-empty white panel up top.
         file_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         layout.addWidget(file_group)
+        self._video_only_widgets.append(file_group)
 
         # --- Output filename ---
         out_layout = QHBoxLayout()
@@ -1071,6 +1099,7 @@ class VideoHighlighterGUI(QWidget):
         out_layout.addWidget(QLabel("Output base name:"))
         out_layout.addWidget(self.output_input)
         layout.addLayout(out_layout)
+        self._video_only_layouts.append(out_layout)
 
         highlights_cfg = self.config_data.get("highlights", {})
         scoring_cfg = self.config_data.get("scoring", {})
@@ -1173,6 +1202,7 @@ class VideoHighlighterGUI(QWidget):
         time_range_group.setLayout(time_range_layout)
         time_range_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         layout.addWidget(time_range_group)
+        self._video_only_widgets.append(time_range_group)
 
         # Enable slider if checkbox was already checked from config
         if self.use_time_range_chk.isChecked():
@@ -1197,6 +1227,7 @@ class VideoHighlighterGUI(QWidget):
         )
         self.live_preview_checkbox.toggled.connect(self._on_live_preview_toggled)
         layout.addWidget(self.live_preview_checkbox)
+        self._video_only_widgets.append(self.live_preview_checkbox)
         self.preview_window = None  # DetectionPreviewWindow, created on demand
         # Read from detection threads, so it mirrors the checkbox rather than
         # being queried across threads (same reason Worker keeps its own copy).
@@ -1213,6 +1244,7 @@ class VideoHighlighterGUI(QWidget):
             "already-processed video."
         )
         layout.addWidget(self.force_reprocess_checkbox)
+        self._video_only_widgets.append(self.force_reprocess_checkbox)
 
         # --- Progress Section (hidden when idle) ---
         self.progress_group = QGroupBox("Progress")
@@ -1250,6 +1282,10 @@ class VideoHighlighterGUI(QWidget):
         # spot. It only appears while a download or pipeline/analysis runs.
         self.progress_group.setVisible(False)
         layout.addWidget(self.progress_group)
+        # Deliberately not in _video_only_widgets: it owns its own visibility
+        # (shown only while a run is active), so blanket-showing it on a switch
+        # back to Video would reveal an empty progress box. set_mode() only ever
+        # hides it.
 
         # --- Tabs ---
         # Kept on self so features elsewhere can bring a tab forward — the
@@ -2709,7 +2745,22 @@ class VideoHighlighterGUI(QWidget):
         tabs.setMinimumHeight(280)
         content_splitter.addWidget(tabs)
         self.content_splitter = content_splitter
-        layout.addWidget(content_splitter)
+        layout.addWidget(content_splitter, 1)
+        self._video_only_widgets.append(content_splitter)
+
+        # --- Photo workspace (the other half of the app) ---
+        # Built once, hidden until the mode switch asks for it. Kept out of the
+        # tab strip on purpose: it is a peer of the whole video UI, not a peer
+        # of "Basic Settings".
+        try:
+            from modules.photo_tab import PhotoTab
+            self.photo_tab = PhotoTab(log_fn=self.append_log)
+            self.photo_tab.setVisible(False)
+            layout.addWidget(self.photo_tab, 1)
+        except Exception as e:
+            # A broken photo side must not stop the video app from launching.
+            self.photo_tab = None
+            print(f"Photo workspace unavailable: {e}")
 
         # --- Tab 4: LLM Chat ---
         llm_tab = QWidget()
@@ -2897,6 +2948,7 @@ class VideoHighlighterGUI(QWidget):
         ctrl_layout.addWidget(self.report_only_btn)
         ctrl_layout.addWidget(self.run_btn)
         layout.addLayout(ctrl_layout)
+        self._video_only_layouts.append(ctrl_layout)
 
         # --- Log view (inside splitter) ---
         self.log_output = QTextEdit()
@@ -2958,6 +3010,36 @@ class VideoHighlighterGUI(QWidget):
         pidx = self.process_mode_combo.findData(pmode)
         self.process_mode_combo.setCurrentIndex(pidx if pidx >= 0 else 0)
         self.on_process_mode_changed()  # sync spinner enabled
+
+    # --- Mode switching (Video | Photos) ---
+    def set_mode(self, mode: str):
+        """Swap the window between the video app and the photo app.
+
+        Both halves stay constructed; only visibility changes, so switching is
+        instant and neither side loses its state. A run in progress keeps going
+        in the background — the mode switch is a view, not a cancel.
+        """
+        photo = (mode == "photo") and getattr(self, "photo_tab", None) is not None
+
+        for w in self._video_only_widgets:
+            w.setVisible(not photo)
+        for lay in self._video_only_layouts:
+            for i in range(lay.count()):
+                item = lay.itemAt(i)
+                w = item.widget() if item else None
+                if w is not None:
+                    w.setVisible(not photo)
+
+        if photo:
+            # Never leave the progress box on screen in photo mode; it belongs
+            # to the video pipeline and would just be a stranded empty group.
+            self.progress_group.setVisible(False)
+
+        if getattr(self, "photo_tab", None) is not None:
+            self.photo_tab.setVisible(photo)
+
+        self.mode_video_btn.setChecked(not photo)
+        self.mode_photo_btn.setChecked(photo)
 
     # --- About / Contact tab ---
     @staticmethod
