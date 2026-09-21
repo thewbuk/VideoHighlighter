@@ -68,8 +68,8 @@ OpenAI Whisperを利用して字幕付きのテキストを生成します。
 [Releases](https://github.com/Aseiel/VideoHighlighter/releases) から最新の `.exe` ファイルをダウンロードしてください。Pythonやその他の依存関係は不要です。
 
 ### Linux / ソースからのビルド
-1. **Python & FFmpeg**
-   FFmpegはインストールされており、システムのPATHに含まれている必要があります。
+1. **Python**
+   `pip install -r requirements.txt` を実行してください。FFmpegは（`imageio-ffmpeg`経由で）一緒にインストールされるため、別途インストールする必要はありません。PATH上に既にFFmpegがある場合はそちらが使われます。
 
 ## 使用方法
 Linux: python main.py  
@@ -85,12 +85,14 @@ VideoHighlighterは時々、ユーザーの動画に対して「意見」を述�
 
 OpenAI WhisperはMITライセンスで提供されており、自由に利用できます。
 
-Google Translate APIは任意です。非公式ライブラリ（googletrans）を使用する場合はAPIキーは不要ですが、Googleがエンドポイントを変更した場合、結果が正しく表示されないことがあります。
+字幕の翻訳は [ollama](https://ollama.com) 経由のローカル LLM で実行されます。翻訳サービス、API キー、アカウントは一切不要で、テキストがマシンの外に出ることはありません。ollama がない場合、字幕は話された言語のまま書き出されます。
 
 このプロジェクトには有料のAPIキーは含まれていません。公式サービスを利用する場合、ユーザー自身でキーを用意する必要があります。
 
 
 ## ライセンス
+
+Copyright (C) 2026 Przemysław Kreft, Meric Donmezer.
 
 このリポジトリはGNU Affero General Public License v3.0（AGPLv3）の下で公開されています。コードを自由に利用、修正、配布することができますが、ネットワーク経由で提供されるものを含むすべての修正版については、同じライセンスの下でその完全なソースコードを公開しなければなりません。
 

@@ -14,7 +14,7 @@ slightly different from before", which is much harder to notice.
 
 It does **not** exercise:
 
-- the ML models (YOLO, OpenVINO action recognition, Whisper, Resemblyzer)
+- the ML models (YOLOX, OpenVINO action recognition, Whisper, Resemblyzer)
 - GPU / hardware-dependent paths
 - the GUI (`main.py`)
 - FFmpeg cutting / concat
@@ -39,7 +39,7 @@ Expected: all green in <5 seconds.
 ## How it stays light
 
 `tests/conftest.py` installs `MagicMock` shims for `cv2`, `torch`, `whisper`,
-`googletrans`, `ultralytics`, `openvino`, and friends **before** any test
+`openvino`, and friends **before** any test
 imports the modules under test. So `pip install -r requirements.txt`
 (~1.9 GB) is not required to run the suite — only pytest + numpy.
 
@@ -63,14 +63,13 @@ Three rules for tests added under this directory:
 
 | File | Module covered | Why it matters |
 |------|---------------|----------------|
-| `test_merge_seconds.py` | `modules.compute_forbidden._merge_seconds` | Powers the AVOID(skip) flow |
-| `test_cluster_points.py` | `modules.auto_segments.cluster_points` | Auto-segmentation core when `CLIP_TIME=0` |
-| `test_snap_to_scene.py` | `modules.auto_segments.snap_to_scene` | Scene-boundary alignment |
-| `test_region.py` | `modules.auto_segments.Region` | Overlap/merge geometry for highlight regions |
-| `test_srt_timestamp.py` | `modules.transcript_srt.format_timestamp_srt` | SRT spec compliance for every subtitle written |
+| `test_merge_seconds.py` | `modules.segments.compute_forbidden._merge_seconds` | Powers the AVOID(skip) flow |
+| `test_cluster_points.py` | `modules.segments.auto_segments.cluster_points` | Auto-segmentation core when `CLIP_TIME=0` |
+| `test_snap_to_scene.py` | `modules.segments.auto_segments.snap_to_scene` | Scene-boundary alignment |
+| `test_region.py` | `modules.segments.auto_segments.Region` | Overlap/merge geometry for highlight regions |
+| `test_srt_timestamp.py` | `modules.audio.transcript_srt.format_timestamp_srt` | SRT spec compliance for every subtitle written |
 
 Next additions (Phase 1+):
 
-- `modules.translate` — adapter contract: signature stable across NLLB / MarianMT / googletrans backends.
 - `modules.logging_utils` — JSON-schema validation of emitted log records.
 - Scoring math (the per-second weighted sum + multi-signal boost) — currently buried in `pipeline.run_pipeline`; needs extraction during Phase 2 refactor first.

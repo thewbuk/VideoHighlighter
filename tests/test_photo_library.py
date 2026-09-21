@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from modules.photo_library import (
+from modules.vision.photo_library import (
     PhotoLibrary,
     export_photos,
     list_images,

@@ -1,5 +1,5 @@
 """
-Tests for `modules.highlight_report` — the "why was this moment chosen" record.
+Tests for `modules.report.highlight_report` — the "why was this moment chosen" record.
 
 Pure numpy and stdlib, no Qt, no cv2, no video file: thumbnails are injected
 through `thumbnail_fn`, which is the reason that parameter exists.
@@ -15,7 +15,7 @@ import pytest
 
 import numpy as np
 
-from modules.highlight_report import (
+from modules.report.highlight_report import (
     SILENCE_DBFS,
     boxes_by_second,
     build_report,
@@ -263,7 +263,7 @@ class TestSectionsAndNav:
         assert '<span class="glabel">The footage</span>' not in page
 
     def test_the_group_appears_once_its_sections_do(self):
-        from modules.highlight_report import _group
+        from modules.report.highlight_report import _group
 
         assert _group("Nothing", "note", "", "") == ""
         built = _group("Something", "note", "", "<h2>Here</h2>")
@@ -271,7 +271,7 @@ class TestSectionsAndNav:
         assert built.endswith("<h2>Here</h2>")
 
     def test_the_labels_are_escaped_like_everything_else(self):
-        from modules.highlight_report import _group
+        from modules.report.highlight_report import _group
 
         built = _group("<b>x</b>", "<i>y</i>", "<h2>Here</h2>")
         assert "<b>x</b>" not in built and "&lt;b&gt;x&lt;/b&gt;" in built
@@ -299,7 +299,7 @@ class TestSectionsAndNav:
         """
         import re
 
-        from modules import highlight_report as mod
+        from modules.report import highlight_report as mod
 
         page = render_html(self._report())
         headings = re.findall(r"<h2[^>]*>([^<]+)</h2>", page)
@@ -366,7 +366,68 @@ class TestRenderers:
         write_report(rep, str(html_path), str(json_path))
 
         assert html_path.read_text(encoding="utf-8").startswith("<!doctype html>")
-        assert json.loads(json_path.read_text(encoding="utf-8"))["schema"] == 3
+        assert json.loads(json_path.read_text(encoding="utf-8"))["schema"] == 4
+
+
+class TestProvenance:
+    """Which file was read, by which build, when.
+
+    A report acted on professionally has to survive the question "prove the
+    footage you still hold is the footage this measured", and a filename does
+    not answer it.
+    """
+
+    def _report(self, path, **kw):
+        sig = _signals(object={17: 10.0})
+        return build_report(video_path=path, video_duration=60,
+                            score=_score(sig), signals=sig,
+                            segments=[(10, 20)], **kw)
+
+    def test_digest_identifies_the_source_file(self, tmp_path):
+        import hashlib
+
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"not really a video, but it hashes the same way")
+        rep = self._report(str(video))
+        expected = hashlib.sha256(video.read_bytes()).hexdigest()
+        assert rep["video"]["sha256"] == expected
+        assert rep["video"]["size"] == video.stat().st_size
+
+    def test_a_changed_byte_changes_the_digest(self, tmp_path):
+        first = tmp_path / "a.mp4"
+        first.write_bytes(b"aaaa")
+        second = tmp_path / "b.mp4"
+        second.write_bytes(b"aaab")
+        assert (self._report(str(first))["video"]["sha256"]
+                != self._report(str(second))["video"]["sha256"])
+
+    def test_an_unreadable_source_is_reported_not_raised(self):
+        """A missing file must not cost the run its report."""
+        rep = self._report("no-such-file.mp4")
+        assert "sha256" not in rep["video"]
+        assert rep["video"]["error"]
+
+    def test_a_caller_that_already_hashed_is_not_charged_twice(self, tmp_path):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"x" * 32)
+        rep = self._report(str(video), source={"sha256": "deadbeef", "size": 3})
+        assert rep["video"]["sha256"] == "deadbeef"
+
+    def test_the_run_is_stamped_in_utc_and_names_the_build(self):
+        rep = self._report("a.mp4")
+        assert rep["generated_at_utc"].endswith("+00:00")
+        assert rep["tool"]["name"] == "VideoHighlighter"
+
+    def test_both_renderers_carry_the_digest(self, tmp_path):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"evidence")
+        rep = self._report(str(video))
+        digest = rep["video"]["sha256"]
+        assert digest in render_text(rep)
+        assert digest in render_html(rep)
+
+    def test_the_page_says_why_there_is_no_digest(self):
+        assert "not computed" in render_html(self._report("gone.mp4"))
 
 
 class TestTagGrouping:
@@ -679,7 +740,7 @@ class TestReportAsSwapInput:
         assert segments_from_report(self._report()) == [(55.0, 65.0), (145.0, 155.0)]
 
     def test_a_report_can_be_swapped_without_the_video(self, tmp_path):
-        from modules.highlight_select import swap_segment
+        from modules.segments.highlight_select import swap_segment
 
         path = tmp_path / "r.json"
         write_report(self._report(), str(tmp_path / "r.html"), str(path))
@@ -897,7 +958,7 @@ class TestConfidenceExcludesRules:
 class TestSubjectComparison:
     """The comparative reading reaches the record and both renderers.
 
-    `modules.highlight_compare` owns the arithmetic and is tested there; what is
+    `modules.segments.highlight_compare` owns the arithmetic and is tested there; what is
     checked here is the wiring — that a caller passing the detector's boxes and
     the expression scan gets findings in the JSON, on the page and in the debug
     log, and that a caller passing neither is not penalised for it.
@@ -1019,7 +1080,7 @@ def _player_report():
 
 
 def test_media_src_is_relative_and_percent_encoded():
-    from modules.highlight_report import media_src_for
+    from modules.report.highlight_report import media_src_for
     rep = _player_report()
     src = media_src_for(rep, os.path.join(MEDIA_DIR, "out_why.html"))
     assert src == "clip%20test%20%5Bx%5D.mp4"
@@ -1030,7 +1091,7 @@ def test_media_src_is_relative_and_percent_encoded():
 
 def test_media_src_walks_up_when_the_report_is_written_elsewhere(tmp_path):
     """Real absolute dirs, so this exercises relpath rather than one OS's spelling."""
-    from modules.highlight_report import media_src_for
+    from modules.report.highlight_report import media_src_for
     movies, reports = tmp_path / "movies", tmp_path / "reports"
     movies.mkdir()
     reports.mkdir()
@@ -1048,7 +1109,7 @@ def test_media_src_walks_up_when_the_report_is_written_elsewhere(tmp_path):
                     reason="only Windows has volumes with no relative path between them")
 def test_media_src_declines_rather_than_emitting_an_absolute_path():
     """A different drive has no relative path; a file:// URL would only work here."""
-    from modules.highlight_report import media_src_for
+    from modules.report.highlight_report import media_src_for
     rep = build_report(
         video_path=r"D:\movies\clip.mp4", video_duration=10.0,
         score=np.ones(11), signals={}, segments=[(0, 10)],
@@ -1059,7 +1120,7 @@ def test_media_src_declines_rather_than_emitting_an_absolute_path():
 
 
 def test_each_clip_gets_a_player_seeked_to_its_own_range():
-    from modules.highlight_report import media_src_for
+    from modules.report.highlight_report import media_src_for
     rep = _player_report()
     page = render_html(rep, media_src=media_src_for(rep, os.path.join(MEDIA_DIR, "o.html")))
     assert page.count("<video") == 2
@@ -1068,8 +1129,27 @@ def test_each_clip_gets_a_player_seeked_to_its_own_range():
     assert 'preload="none"' in page
 
 
+def test_a_player_works_where_the_media_fragment_is_ignored():
+    """The bounds survive a browser that drops `#t=`, which is most mobile ones.
+
+    A report is read away from the machine that wrote it more often than on it,
+    so the fragment cannot be the only thing carrying the clip's start and end.
+    `playsinline` belongs to the same problem: a player that seizes the screen
+    on tap is no longer beside the figures it exists to let a reader check.
+    """
+    from modules.report.highlight_report import media_src_for
+    rep = _player_report()
+    page = render_html(rep, media_src=media_src_for(rep, os.path.join(MEDIA_DIR, "o.html")))
+    assert page.count("playsinline") == 2
+    assert re.findall(r'data-start="([0-9.]+)"', page) == ["10.00", "40.00"]
+    assert re.findall(r'data-end="([0-9.]+)"', page) == ["20.00", "50.00"]
+    # Both halves, or the fallback only fixes where the clip starts and lets it
+    # run on into footage the claim beside it was never about.
+    assert "loadedmetadata" in page and "timeupdate" in page
+
+
 def test_the_seek_button_targets_the_loudest_second():
-    from modules.highlight_report import media_src_for
+    from modules.report.highlight_report import media_src_for
     rep = _player_report()
     page = render_html(rep, media_src=media_src_for(rep, os.path.join(MEDIA_DIR, "o.html")))
     assert re.findall(r'data-t="([0-9.]+)"', page) == ["10", "40"]
@@ -1088,7 +1168,7 @@ def test_the_page_is_standalone_when_no_source_is_linked():
 
 
 def test_a_missing_source_is_explained_rather_than_silent():
-    from modules.highlight_report import media_src_for
+    from modules.report.highlight_report import media_src_for
     rep = _player_report()
     page = render_html(rep, media_src=media_src_for(rep, os.path.join(MEDIA_DIR, "o.html")))
     assert "Source video not found" in page
@@ -1096,7 +1176,7 @@ def test_a_missing_source_is_explained_rather_than_silent():
 
 
 def test_write_report_can_opt_out_of_linking(tmp_path):
-    from modules.highlight_report import write_report
+    from modules.report.highlight_report import write_report
     html_path = tmp_path / "r.html"
     write_report(_player_report(), str(html_path), link_media=False)
     assert "<video" not in html_path.read_text(encoding="utf-8")
@@ -1145,7 +1225,7 @@ def test_source_range_is_still_the_default_everywhere_else():
 
 def test_the_cut_timeline_gives_every_clip_visible_width():
     """A 10s clip in an hour is two pixels on the full-video strip; not here."""
-    from modules.highlight_report import _cut_timeline
+    from modules.report.highlight_report import _cut_timeline
     svg = _cut_timeline(_cut_report())
     assert "The cut, end to end" in svg
     widths = [float(w) for w in re.findall(r'<rect[^>]*width="([0-9.]+)"', svg)]
@@ -1156,7 +1236,7 @@ def test_the_cut_timeline_gives_every_clip_visible_width():
 
 
 def test_the_cut_timeline_carries_both_clocks_for_each_clip():
-    from modules.highlight_report import _cut_timeline
+    from modules.report.highlight_report import _cut_timeline
     svg = _cut_timeline(_cut_report())
     assert "in the output" in svg          # tooltip
     assert "In the highlight" in svg       # table heading
@@ -1164,7 +1244,7 @@ def test_the_cut_timeline_carries_both_clocks_for_each_clip():
 
 
 def test_no_clips_means_no_cut_timeline():
-    from modules.highlight_report import _cut_timeline
+    from modules.report.highlight_report import _cut_timeline
     assert _cut_timeline({"segments": []}) == ""
 
 
@@ -1204,7 +1284,7 @@ def test_a_clip_with_no_peak_carries_no_claim():
 
 
 def test_the_sentence_names_the_shape_not_the_word_action():
-    from modules.highlight_prose import describe_motion_peak
+    from modules.report.highlight_prose import describe_motion_peak
     said = describe_motion_peak({"motion_peak": {"second": 118,
                                                 "timestamp": "1:58", "count": 1}})
     assert "spiked at 1:58" in said
@@ -1215,14 +1295,14 @@ def test_the_sentence_names_the_shape_not_the_word_action():
 
 def test_a_peak_that_scored_nothing_is_not_narrated():
     """It is in the breakdown already; a sentence would imply it drove the pick."""
-    from modules.highlight_report import _measurements
+    from modules.report.highlight_report import _measurements
     rep = _motion_report([118.0], points=0.0)
     entry = rep["segments"][0]
     assert "spiked at" not in _measurements(entry, [20.0])
 
 
 def test_both_marked_seconds_get_a_seek_button():
-    from modules.highlight_report import media_src_for, render_html
+    from modules.report.highlight_report import media_src_for, render_html
     rep = _motion_report([118.0])
     rep["segments"][0]["loudest"] = {"second": 110, "timestamp": "1:50",
                                      "level_dbfs": -12.0, "classes": []}
@@ -1233,7 +1313,7 @@ def test_both_marked_seconds_get_a_seek_button():
 
 def test_seek_buttons_follow_the_clock_not_the_computation_order():
     """The row is a miniature timeline; it must not run backwards."""
-    from modules.highlight_report import media_src_for, render_html
+    from modules.report.highlight_report import media_src_for, render_html
     rep = _motion_report([105.0])
     rep["segments"][0]["loudest"] = {"second": 125, "timestamp": "2:05",
                                      "level_dbfs": -12.0, "classes": []}
@@ -1244,7 +1324,7 @@ def test_seek_buttons_follow_the_clock_not_the_computation_order():
 
 
 def test_the_later_signal_comes_second():
-    from modules.highlight_report import media_src_for, render_html
+    from modules.report.highlight_report import media_src_for, render_html
     rep = _motion_report([128.0])
     rep["segments"][0]["loudest"] = {"second": 104, "timestamp": "1:44",
                                      "level_dbfs": -12.0, "classes": []}
@@ -1397,3 +1477,118 @@ class TestConversation:
 
     def test_a_report_nobody_asked_anything_shows_no_thread(self):
         assert "Asked of this report" not in render_html(_player_report())
+
+
+class TestServeLink:
+    """Where to go when the players are dead.
+
+    A report is read away from its footage more often than beside it, and there
+    the page is fully true and fully unplayable at once — which reads as broken
+    rather than as displaced. The link is the difference.
+    """
+
+    def test_no_link_when_nothing_says_where_it_is_served(self):
+        page = render_html(_player_report())
+        assert "open this report over the network" not in page
+
+    def test_the_link_points_at_this_report_not_the_folder(self, tmp_path):
+        from modules.report.highlight_report import serve_url_for
+        url = serve_url_for("http://192.168.0.10:8000/", r"D:\m\a b&c_why.html")
+        # Landing on a directory listing means reading the filename off a phone
+        # screen, which is the thing this exists to avoid.
+        assert url == "http://192.168.0.10:8000/a%20b%26c_why.html"
+
+    def test_a_base_without_a_trailing_slash_still_works(self):
+        from modules.report.highlight_report import serve_url_for
+        assert serve_url_for("http://h:8000", "x_why.html") == \
+            "http://h:8000/x_why.html"
+
+    def test_an_empty_base_is_not_a_link(self):
+        from modules.report.highlight_report import serve_url_for
+        assert serve_url_for("", "x_why.html") is None
+        assert serve_url_for("   ", "x_why.html") is None
+        assert serve_url_for(None, "x_why.html") is None
+
+    def test_the_standalone_copy_carries_it_too(self):
+        """The copy with no players is the one that most needs the address."""
+        page = render_html(_player_report(), serve_url="http://h:8000/r.html")
+        assert "<video" not in page
+        assert "open this report over the network" in page
+        assert 'href="http://h:8000/r.html"' in page
+
+    def test_a_re_render_from_the_record_keeps_the_link(self):
+        """Both narration passes re-render from the record and know nothing
+        about serving, so the record has to carry it."""
+        rep = dict(_player_report())
+        rep["serve_url"] = "http://h:8000/r.html"
+        assert "open this report over the network" in render_html(rep)
+
+    def test_write_report_records_it_for_those_re_renders(self, tmp_path):
+        from modules.report.highlight_report import write_report
+        rep = dict(_player_report())
+        out = tmp_path / "r_why.html"
+        write_report(rep, str(out), link_media=False,
+                     serve_base="http://h:8000/")
+        assert rep["serve_url"] == "http://h:8000/r_why.html"
+        assert "open this report over the network" in out.read_text(encoding="utf-8")
+
+
+class TestMediaLink:
+    """The fallback that needs nothing running.
+
+    A browser cannot fetch `smb://`, but it can hand one to a player app, so a
+    report read off a share can still reach its footage. What it cannot do is
+    carry a position — which the page has to say, or the reader wonders why the
+    clip they were promised is not what started playing.
+    """
+
+    def test_no_link_without_a_base(self):
+        page = render_html(_player_report())
+        assert "open the source in a player app" not in page
+
+    def test_the_link_points_at_the_video_not_the_report(self):
+        from modules.report.highlight_report import media_url_for
+        rep = _player_report()
+        url = media_url_for("smb://192.168.0.10/movies/", rep)
+        assert url.startswith("smb://192.168.0.10/movies/")
+        assert url.endswith(".mp4"), "a share link to the HTML would open a viewer"
+
+    def test_the_base_may_or_may_not_end_in_a_slash(self):
+        from modules.report.highlight_report import media_url_for
+        rep = _player_report()
+        assert media_url_for("smb://h/m", rep) == media_url_for("smb://h/m/", rep)
+
+    def test_nothing_without_a_base_or_a_source(self):
+        from modules.report.highlight_report import media_url_for
+        assert media_url_for("", _player_report()) is None
+        assert media_url_for(None, _player_report()) is None
+        assert media_url_for("smb://h/m/", {"video": {}}) is None
+
+    def test_every_clip_carries_it_and_says_where_to_seek(self):
+        rep = _player_report()
+        page = render_html(rep, media_url="smb://h/m/v.mp4")
+        assert page.count("open the source in a player app") == 2
+        # The position cannot ride along in the URL, so it has to be in words.
+        assert "seek to" in page
+        assert "smb://h/m/v.mp4" in page
+
+    def test_it_survives_in_the_standalone_copy(self):
+        """The copy with no players is the one this exists for."""
+        page = render_html(_player_report(), media_src=None,
+                           media_url="smb://h/m/v.mp4")
+        assert "<video" not in page
+        assert "open the source in a player app" in page
+
+    def test_a_re_render_from_the_record_keeps_it(self):
+        rep = dict(_player_report())
+        rep["media_url"] = "smb://h/m/v.mp4"
+        assert "open the source in a player app" in render_html(rep)
+
+    def test_write_report_records_it(self, tmp_path):
+        from modules.report.highlight_report import write_report
+        rep = dict(_player_report())
+        out = tmp_path / "r_why.html"
+        write_report(rep, str(out), link_media=False,
+                     media_base="smb://h/movies/")
+        assert rep["media_url"].startswith("smb://h/movies/")
+        assert "open the source in a player app" in out.read_text(encoding="utf-8")

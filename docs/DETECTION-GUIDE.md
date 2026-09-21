@@ -25,15 +25,17 @@ fast and reliable about.
 
 ---
 
-## 1. Object recognition (YOLO)
+## 1. Object recognition (YOLOX)
 
 **Answers:** where is this thing, right now, in this frame.
 
 **Speed:** real time.
 
 **Vocabulary:** the 80 COCO classes out of the box, plus any model you train
-and import. Runs a `.pt` model directly or an OpenVINO export (`yolo11n_
-openvino_model/` by default), whichever you point it at.
+in the app (the Train tab) or import as `.onnx` / OpenVINO `.xml`. The stock
+models download on first use into `models/yolox/`. Runs on OpenVINO; on an AMD
+or NVIDIA card the stock detector runs through ONNX Runtime's DirectML
+provider instead.
 
 **Strengths.** Precise boxes, stable confidence, cheap enough to run over a
 whole video. Because it emits boxes it can *count*, and counting is exact:
@@ -131,6 +133,46 @@ events:
 means "none of these inside that". Source boxes are consumed across rules, so
 two rules each needing one source genuinely require two distinct objects.
 
+### An event the models have no word for
+
+This is what the engine is really for. Action recognition answers from a fixed
+list of 400 classes: ask it about anything outside that list and it returns the
+nearest thing inside it, with the confidence you would expect from a wrong
+answer. A rule is not limited that way. It describes a *relation* between
+detections — one class inside another, counted, holding steady over a window —
+so the event is whatever that relation means in your footage, under the name
+you gave it.
+
+A goal, for instance, is a ball whose centre is inside the net:
+
+```yaml
+events:
+  - name: ball_in_net
+    label: Ball in net
+    window_secs: 0.3        # it is only in there briefly — smooth less
+    persist_secs: 0.2
+    rules:
+      - {source: sports ball, region: net, min_count: 1}
+```
+
+The same rules in the app, where they are edited and run:
+
+![Composition rules editor: a spatial rule firing when a sports ball is inside a net, a second for a ball at a player, and a signal rule on vocal density](../assets/Composition_Engine.png)
+
+`sports ball` is one of the 80 classes the stock detector already knows. The net
+is not, so that single class is what you label and train — one primitive,
+reusable, rather than a "goal" class the network would have to infer from pixels
+that do not contain the distinction. The rule supplies the meaning. See
+[Primitives, not categories](#primitives-not-categories) below.
+
+### Confidence follows the weakest detection
+
+A composed event is only as sure as the weakest detection it matched, so it
+carries *detector* confidence rather than a classifier's guess at a class it was
+never taught. In the rule above, a ball found at 0.91 inside a net found at 0.87
+scores 0.87 — and 80–100% is the ordinary case, for moments an action label
+would score far lower and often name wrongly.
+
 ### Two settings worth understanding
 
 **`persist_secs`** keeps a class alive after its last detection. Raise it when
@@ -143,6 +185,55 @@ corrupting `min_count` rules.
 a *state* test, evaluated per frame. It answers "is this true now", not "did
 this just start". For something that appears and then stays on screen, a rule
 will keep firing for as long as it remains visible.
+
+### Not yet: how far inside
+
+A rule tests whether the source box's **centre** falls inside the region box.
+There is no "how deep" threshold, so depth is decided when you label: draw the
+region around the mouth of something and touching it counts, draw it around the
+space behind and only fully entering does.
+
+That is enough for most things and wrong for some. A box is axis-aligned and a
+net is a volume seen in perspective, so the fraction of a ball inside the
+*box* is not the fraction inside the *net*, and no threshold on box overlap
+would fix it.
+
+Doing it properly needs contours rather than boxes:
+
+- a segmentation model for the region class, so the cache carries a mask or a
+  polygon instead of four numbers;
+- a depth measure over that contour — how far past the front edge the source's
+  centre sits, or what fraction of its area the mask contains;
+- a rule option for it, defaulting to today's centre test so no existing rule
+  changes meaning.
+
+The first of those is the real cost: it is a different export and a wider cache
+format, and every rule that does not ask for depth would still pay to store
+them. Worth doing when something actually needs to distinguish "on the line"
+from "over it".
+
+### Where rules live, and what they cost
+
+Rules live in `composition_rules.yaml` in your user data folder — beside the
+executable on Windows, `~/Library/Application Support/VideoHighlighter` on
+macOS, the project root when running from source. Nothing ships with a rule set,
+and the file is gitignored, so the events you define stay on your machine. With
+no file present the engine is skipped entirely.
+
+Composed events get their own rows on the timeline, directly under the waveform,
+one row per rule that actually fired, filterable separately from objects and
+actions.
+
+They run on **every** pass, over whatever detections are already to hand — a
+rule is a reading of boxes that already exist, not a second detection. So
+editing one and re-running costs milliseconds and never invalidates the cache.
+The loop is: change a threshold, re-run, read the report, change it again.
+
+![Workflow stages: process video and AI, cache the results, review them in the timeline UI, edit, then adjust and reprocess against the same cache](../assets/workflow_stages.png)
+
+That cache is what makes the loop cheap — the detection pass is the expensive
+part, and adjusting scoring, rules or thresholds re-reads it rather than
+redoing it.
 
 ---
 
@@ -192,10 +283,12 @@ When no engine above can see your subject, you train a detector. Briefly:
 - **If two architectures score the same, you are data-limited, not
   model-limited.** Stop swapping backbones; fix the data.
 
-**On licensing:** this edition is AGPL-3.0 and uses ultralytics YOLO, which is
-also AGPL-3.0, so you can train and ship models with the ultralytics tooling
-freely — as long as whatever you distribute is AGPL too. That is the normal
-case here and needs no special handling.
+**On licensing:** detection and training here are YOLOX (Apache-2.0), and the
+app deliberately depends on no AGPL detector. That is what lets a model you
+train be shared and used by anyone, in any build: a model trained with an AGPL
+toolkit inherits that licence, and the app's model packages refuse a detector
+whose output layout is not YOLOX's. When you share a model, share the model —
+never the frames, clips or audio it was trained on.
 
 ---
 

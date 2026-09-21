@@ -1,12 +1,38 @@
 numpy
 torch
+# AMD GPUs go through DirectML, and `torch-directml` is deliberately NOT listed
+# here. It pins an exact torch version, so pip satisfies it by *replacing* the
+# installed torch, which silently removes Arc (+xpu) or CUDA (+cu128) support on
+# any machine that had it. It is opt-in, user-installed, into its own virtualenv.
+# (Also: there is no `torch-directml>=1.13`; releases are dated dev builds like
+# 0.2.5.dev240914, so a normal version floor matches nothing.) See docs/AMD-GPU.md.
+#
+# ONNX Runtime's DirectML provider is the half of that story a build *can* ship:
+# it declares no torch dependency, so it sits beside the CUDA torch above instead
+# of replacing it, and it gives a DX12 card the heaviest stage (object detection)
+# through an ONNX export. Windows-only wheels, hence the marker. Keep it the only
+# onnxruntime here: `onnxruntime` and `onnxruntime-gpu` install the same package
+# and would overwrite it.
+onnxruntime-directml; sys_platform == "win32"
 pyyaml
+psutil  # memory readouts, and the --smoke-test process-tree watch (BSD-3)
 opencv-python>=4.7  # FaceDetectorYN (YuNet) + FaceRecognizerSF (SFace) need >=4.5.4
 tqdm
 openai-whisper
-googletrans==4.0.0rc1
+# Translation is LLM-based (ollama) — no machine-translation library is
+# required. The httpx floor keeps pip off ancient releases whose `import cgi`
+# breaks on Python 3.13 and conflicts with the ML stack.
+httpx>=0.24
 openvino==2026.2.1
-ultralytics
+# Object detection is YOLOX (Apache-2.0): the runtime is OpenVINO above, and the
+# stock models download on first use. Training a detector in the app also needs
+# the yolox package itself, installed separately and WITHOUT its deps, because
+# its declared requirements would let pip replace the torch build:
+#     pip install yolox==0.3.0 --no-deps
+# Nothing here may depend on an AGPL detector: a model trained on one inherits
+# the licence, and models made in this app are meant to be shared.
+pycocotools  # yolox's COCO dataset reader
+loguru       # imported by yolox at module level
 PySide6
 beautifulsoup4
 yt-dlp
@@ -31,6 +57,11 @@ pytorchvideo
 iopath
 protobuf
 onnx
+# Community models (model_hub): browse, install and share on Hugging Face.
+huggingface_hub  # Apache-2.0
+keyring          # MIT; keeps the Hugging Face token in the OS credential store
+onnxscript  # torch.onnx.export needs it; without it the DirectML R3D export fails
+            # and action recognition quietly stays on the CPU (modules/vision/r3d_onnx.py)
 ffmpeg-python
 selenium
 trio
@@ -41,7 +72,7 @@ webdriver-manager
 # on Intel GPU / CPU. pillow is above.
 transformers
 optimum-intel  # OpenVINO backend only — the CUDA path does not import it
-cryptography  # Ed25519 verification of release manifests (modules/update_manifest.py).
+cryptography  # Ed25519 verification of release manifests (modules/update/update_manifest.py).
               # The updater replaces executables, so an unverified manifest is
               # not installed at all — without this the update check still
               # notifies, but can never self-install.

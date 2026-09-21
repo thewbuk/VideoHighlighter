@@ -6,12 +6,12 @@ the assembled version.
 
 | Piece | Module | What it owns |
 |---|---|---|
-| Ingest | `modules/gopro_ingest.py` | Finding a card, copying it off safely |
-| Script | `modules/script_plan.py` | What the film should contain |
-| Music | `modules/music_analysis.py` | Where the beats are |
-| Cut list | `modules/edl.py` | Which piece of which file, when |
-| Transitions | `modules/transitions.py` | How one clip becomes the next |
-| Runner | `modules/auto_pipeline.py` | Running the stages, and resuming them |
+| Ingest | `modules/media/gopro_ingest.py` | Finding a card, copying it off safely |
+| Script | `modules/segments/script_plan.py` | What the film should contain |
+| Music | `modules/audio/music_analysis.py` | Where the beats are |
+| Cut list | `modules/media/edl.py` | Which piece of which file, when |
+| Transitions | `modules/media/transitions.py` | How one clip becomes the next |
+| Runner | `modules/segments/auto_pipeline.py` | Running the stages, and resuming them |
 
 ---
 
@@ -51,7 +51,7 @@ truncated transfer.
 Nothing is ever deleted from the card.
 
 ```python
-from modules.gopro_ingest import find_gopro_cards, ingest, write_manifest
+from modules.media.gopro_ingest import find_gopro_cards, ingest, write_manifest
 
 card = find_gopro_cards()[0]
 result = ingest(card, r"D:\movies\GoPro")
@@ -104,7 +104,7 @@ hour: the run completes, the output ignores half of what you wrote, and nothing
 says why.
 
 ```python
-from modules.script_plan import load_script, compile_directives
+from modules.segments.script_plan import load_script, compile_directives
 
 script = load_script("script.yaml")
 script.clip_count            # 5  (Action counts three times)
@@ -151,7 +151,7 @@ empty grid is the identity. A music file that cannot be analysed must not cost
 you the film.
 
 ```python
-from modules.music_analysis import analyze_music, snap_segments
+from modules.audio.music_analysis import analyze_music, snap_segments
 
 a = analyze_music("track.mp3")
 a.bpm, len(a.beats), len(a.downbeats)
@@ -230,6 +230,31 @@ When the nearest whole number of bars would run past the end of the source, the
 a 3.64 s bar becomes one bar, not 6.03 s. Clamping instead is what the first
 real render did, and it put every following cut off the grid.
 
+## Building the reel
+
+The `combine` stage merges the kept clips into one reel and, optionally, writes
+each clip out as a separate file beside it.
+
+**Rotation is baked, not copied.** Phone and GoPro footage carries its
+orientation as metadata, and the concat step throws that metadata away — so
+the frames are rotated for real before concatenation, and the canvas is sized
+to the *displayed* dimensions of the largest input. Portrait clips therefore
+survive a mixed-orientation reel instead of arriving on their side.
+
+**Blur gate.** Clips can be penalised for softness, so a sharp moment wins over
+a blurry one that scored the same on everything else.
+
+`music_mix` then lays the track down in one of three modes:
+
+| Mode | What it does |
+| --- | --- |
+| `replace` | The original audio is dropped; only the music is heard |
+| `mix` | Music is mixed under the original audio |
+| `duck` | Like `mix`, but the music is side-chain compressed against the original, so it drops back whenever there is speech |
+
+A video with no audio stream cannot mix or duck; both degrade to `replace`
+rather than failing.
+
 ## The runner
 
 Every stage records what it produced, and a re-run skips whatever is still on
@@ -255,7 +280,7 @@ is still returned as the output. The expensive work is detection; losing it to
 an audio filter would be absurd.
 
 ```python
-from modules.auto_pipeline import run_auto_pipeline
+from modules.segments.auto_pipeline import run_auto_pipeline
 
 result = run_auto_pipeline(
     dest_root=r"D:\movies\GoPro",

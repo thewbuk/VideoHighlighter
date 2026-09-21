@@ -139,7 +139,7 @@ def main() -> int:
         print(f"\n❌ FAIL — the {backend!r} backend's stack is incomplete:\n   {err}")
         if backend == "torch":
             print("\n   Install a CUDA torch:\n"
-                  "     pip install torch --index-url https://download.pytorch.org/whl/cu124")
+                  "     pip install torch --index-url https://download.pytorch.org/whl/cu128")
         else:
             print('\n   Install the OpenVINO stack:\n'
                   '     pip install "optimum[openvino]" optimum-intel')
@@ -221,4 +221,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from modules.system.debug_console import force_utf8_stdio
+    force_utf8_stdio()
     raise SystemExit(main())

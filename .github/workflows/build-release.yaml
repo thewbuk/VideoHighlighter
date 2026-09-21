@@ -74,15 +74,32 @@ jobs:
       - name: Install dependencies
         run: |
           pip install numpy==2.2.6 mkl mkl-include
-          pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+          pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
           pip install openvino==2026.2.1
           pip install -r requirements.txt
+          # YOLOX (Apache-2.0) for training detectors in the app. --no-deps:
+          # its declared requirements would let pip replace the torch above.
+          pip install yolox==0.3.0 --no-deps
           pip install pyinstaller
       - name: Verify key packages
         run: |
           python -c "import torch; print('Torch:', torch.__version__, 'CUDA:', torch.cuda.is_available())"
           python -c "import openvino; import os; lib_dir = os.path.join(os.path.dirname(openvino.__file__), 'libs'); files = os.listdir(lib_dir); print('OpenVINO libs:', len(files), 'files,', round(sum(os.path.getsize(os.path.join(lib_dir,f)) for f in files)/1e6), 'MB')"
           python -c "import numpy; numpy.show_config()"
+      - name: Check the CUDA build covers every supported GPU generation
+        # The build the exe ships decides which NVIDIA cards get a GPU at all.
+        # torch 2.6.0+cu124 stopped at sm_90, and an RTX 50-series (sm_120) failed
+        # with "no kernel image is available"; a later CUDA line may drop an old
+        # generation instead. get_arch_list() is empty on a runner without a GPU,
+        # so read the compiled list directly: GTX 10, RTX 20, RTX 30 (RTX 40 is
+        # served by the sm_8x kernels) and RTX 50.
+        run: |
+          python -c "import torch; flags = torch._C._cuda_getArchFlags().split(); print('CUDA archs:', ' '.join(flags)); missing = [a for a in ('sm_61', 'sm_75', 'sm_86', 'sm_120') if a not in flags]; assert not missing, 'torch build lacks ' + ', '.join(missing)"
+      - name: Fetch YOLOX detector models (Apache-2.0)
+        # models/yolox/ is gitignored (downloaded, not committed). Without this
+        # the packaged app has no object detector, and a frozen build never
+        # downloads one itself. Bundled via --add-data "models;models".
+        run: python tools/get_yolox_model.py
       - name: Pre-convert CLIP to OpenVINO IR
         run: python -m tools.export_clip_ov
       - name: Build EXE
@@ -117,10 +134,14 @@ jobs:
           --hidden-import PySide6.QtQuickWidgets
           --hidden-import PySide6.QtMultimedia
           --collect-submodules whisper
-          --collect-submodules ultralytics
+          --collect-submodules yolox
+          --collect-submodules model_hub
+          --collect-submodules huggingface_hub
+          --collect-submodules keyring
+          --copy-metadata keyring
           --collect-all openvino
+          --collect-all onnxruntime
           --collect-data whisper
-          --collect-data ultralytics
           --collect-binaries imageio_ffmpeg
           --hidden-import llm.clip_prefilter
           --additional-hooks-dir packaging/pyinstaller-hooks
@@ -134,6 +155,16 @@ jobs:
           --copy-metadata safetensors
           --copy-metadata regex
           main.py
+      - name: Check ml_dtypes can find the DLLs it links against
+        # ml_dtypes (via onnx) links against a delvewheel-renamed MSVC runtime it
+        # expects in numpy.libs. With numpy pinned older than the one ml_dtypes was
+        # built beside, that name is not numpy's own: 0.11.1 and 0.11.2 shipped it
+        # in pandas.libs only, and every DirectML ONNX export failed with "DLL load
+        # failed while importing _ml_dtypes_ext". This reads the names out of the
+        # BUNDLED extension, so it checks what the exe will ask for rather than
+        # what the runner's numpy happens to vendor, which is how it passed before.
+        run: |
+          python -c "import glob, os, re; root = os.path.join('dist', 'VideoHighlighter', '_internal'); exts = glob.glob(os.path.join(root, 'ml_dtypes', '**', '*.pyd'), recursive=True); assert exts, 'no ml_dtypes extension in the bundle, so onnx cannot import'; want = sorted({m.decode() for p in exts for m in re.findall(rb'[\w.+-]+-[0-9a-f]{32}\.dll', open(p, 'rb').read(), re.I)}); libs = os.path.join(root, 'numpy.libs'); have = set(os.listdir(libs)) if os.path.isdir(libs) else set(); missing = [n for n in want if n not in have]; print('ml_dtypes links against:', ', '.join(want) or 'nothing vendored'); assert not missing, 'bundled numpy.libs lacks ' + ', '.join(missing)"
       - name: Report build size
         run: |
           $size = (Get-ChildItem -Recurse ./dist/VideoHighlighter | Measure-Object -Property Length -Sum).Sum / 1GB
@@ -157,6 +188,13 @@ jobs:
         with:
           name: windows-manifest
           path: dist/VideoHighlighter/manifest.json
+          # Artifacts here are a handoff to the `release` job minutes later, not
+          # an archive — the durable copies are the Release assets. At the 90-day
+          # default a single mac DMG is 1.2 GB, and a handful of runs exhausted
+          # the account's storage and blocked every subsequent build with
+          # "Artifact storage quota has been hit" for 6-12 hours at a time.
+          # Anything still wanted after a week is wanted from the Release.
+          retention-days: 7
       - name: Create archive
         run: 7z a -t7z -mx=9 -v1900m "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z" ./dist/VideoHighlighter
       - name: Upload artifact
@@ -164,6 +202,45 @@ jobs:
         with:
           name: windows-build
           path: "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z*"
+          retention-days: 7
+      # Built here rather than in its own job because only this one knows how
+      # many volumes 7-Zip just produced and how big the unpacked tree is — the
+      # installer needs both compiled in (one URL per volume, and a free-space
+      # check it can make before starting a multi-gigabyte download).
+      - name: Build the Windows installer
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.version.outputs.slug }}"
+          $vols = @(Get-ChildItem "VideoHighlighter-Windows-$tag.7z.*" | Sort-Object Name)
+          if ($vols.Count -eq 0) { throw "No .7z volumes to install from." }
+          $archiveMB = [int][math]::Ceiling((($vols | Measure-Object Length -Sum).Sum) / 1MB)
+          $installedMB = [int][math]::Ceiling(((Get-ChildItem dist/VideoHighlighter -Recurse -File |
+            Measure-Object Length -Sum).Sum) / 1MB)
+          Write-Host "volumes=$($vols.Count) download=${archiveMB}MB installed=${installedMB}MB"
+          # Official standalone LZMA extractor; the installer carries it because
+          # a machine with no 7-Zip is exactly the machine this is here for.
+          Invoke-WebRequest -Uri https://www.7-zip.org/a/7zr.exe `
+            -OutFile packaging/installer/7zr.exe -UseBasicParsing
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            "/DAppVersion=$tag" `
+            "/DTag=$tag" `
+            "/DVolumes=$($vols.Count)" `
+            "/DArchiveMB=$archiveMB" `
+            "/DInstalledMB=$installedMB" `
+            "/O$(Get-Location)" `
+            packaging/installer/videohighlighter.iss
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          if-no-files-found: error
+          # Fixed filename, no version in it, so that
+          # /releases/latest/download/00-VideoHighlighter-Windows-Setup.exe is a
+          # permanent link the site and every old post can keep pointing at. The
+          # tag it downloads from is compiled into the exe, not in its name.
+          path: 00-VideoHighlighter-Windows-Setup.exe
+          retention-days: 7
 
   # The web UI: a Tauri shell around the React frontend, with the Python engine
   # bundled as a PyInstaller sidecar. Independent of the Qt build above — both
@@ -191,11 +268,23 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install numpy==2.2.6 mkl mkl-include
-          pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+          pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
           pip install openvino==2026.2.1
           pip install -r requirements.txt
           pip install -r sidecar/requirements.txt
+          # YOLOX (Apache-2.0) for training detectors in the app. --no-deps:
+          # its declared requirements would let pip replace the torch above.
+          pip install yolox==0.3.0 --no-deps
           pip install pyinstaller
+      - name: Check the CUDA build covers every supported GPU generation
+        # Same guard as the Qt build: the sidecar bundles the same CUDA torch.
+        run: |
+          python -c "import torch; flags = torch._C._cuda_getArchFlags().split(); print('CUDA archs:', ' '.join(flags)); missing = [a for a in ('sm_61', 'sm_75', 'sm_86', 'sm_120') if a not in flags]; assert not missing, 'torch build lacks ' + ', '.join(missing)"
+      - name: Fetch YOLOX detector models (Apache-2.0)
+        # models/yolox/ is gitignored (downloaded, not committed). Without this
+        # the packaged app has no object detector, and a frozen build never
+        # downloads one itself. Bundled via --add-data "models;models".
+        run: python tools/get_yolox_model.py
       - name: Pre-convert CLIP to OpenVINO IR
         run: python -m tools.export_clip_ov
       - name: Build the sidecar
@@ -247,6 +336,7 @@ jobs:
           # Fail loudly rather than uploading nothing if the path drifts again.
           if-no-files-found: error
           path: "VideoHighlighter-Web-Windows-${{ needs.version.outputs.slug }}.7z*"
+          retention-days: 7
 
   build-mac:
     needs: version
@@ -261,22 +351,86 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+          # YOLOX (Apache-2.0) for training detectors in the app. --no-deps:
+          # its declared requirements would let pip replace the torch above.
+          # --no-build-isolation: yolox ships an sdist only, and off Windows its
+          # setup.py asserts torch is importable, then pre-compiles
+          # FastCOCOEvalOp. An isolated build env never has torch no matter what
+          # is installed here, so this is the one job where the build has to see
+          # this environment. Windows skips that branch entirely
+          # (`if sys.platform != "win32"`), which is why only mac needs it.
+          # setuptools/wheel go in first because pip cannot provision build
+          # dependencies once isolation is off.
+          pip install setuptools wheel
+          pip install yolox==0.3.0 --no-deps --no-build-isolation
           pip install pyinstaller
+      - name: Fetch YOLOX detector models (Apache-2.0)
+        # models/yolox/ is gitignored (downloaded, not committed). Without this
+        # the packaged app has no object detector, and a frozen build never
+        # downloads one itself. Bundled via --add-data "models;models".
+        run: python tools/get_yolox_model.py
       - name: Pre-convert CLIP to OpenVINO IR
-        # Must run before the libtbb removal below — the export imports openvino,
-        # which needs libtbb.12.dylib at runtime; that lib is stripped afterwards
-        # only for the frozen bundle.
         run: python -m tools.export_clip_ov
-      - name: Fix OpenVINO problematic libraries
+      - name: Give OpenVINO a libtbb that codesign accepts
+        # libtbb.12.dylib was deleted from the bundle in March because it could
+        # not be ad-hoc signed. OpenVINO links against it, so `_pyopenvino` then
+        # failed to load with "Library not loaded: @rpath/libtbb.12.dylib",
+        # which took the whole pipeline with it — action_recognition imports
+        # openvino at module scope. Deleting it is not an option; making it
+        # signable is the job.
+        #
+        # The wheel's copies make codesign fail with "internal error in Code
+        # Signing subsystem" while *replacing an existing signature*, and
+        # PyInstaller signs every binary it collects, so the build dies rather
+        # than the app. Two steps, in order of how little they change:
+        #
+        #   1. strip the signature and prove the file can be signed at all;
+        #   2. if it cannot, substitute Homebrew's build of the same library —
+        #      same oneTBB soname, an ordinary Mach-O that signs cleanly.
+        #
+        # Either way the file is left UNSIGNED, so PyInstaller signs it fresh
+        # rather than replacing anything, which is the operation that failed.
+        #
+        # Every dylib here gets that treatment, not just libtbb. Narrowing it to
+        # one file is how the second attempt failed: libtbb.12 passed and
+        # libtbbmalloc.2 — which kept the wheel's signature — died in exactly
+        # the same place.
+        #
+        # libtbbbind and libhwloc stay deleted: tbbbind is TBB's optional NUMA
+        # layer and links Homebrew's libhwloc by absolute path, which no user
+        # has. TBB runs without it.
         run: |
           OV_LIBS=$(python -c "import openvino; import os; print(os.path.join(os.path.dirname(openvino.__file__), 'libs'))")
           rm -f "$OV_LIBS"/libtbbbind*
-          rm -f "$OV_LIBS"/libtbbmalloc*
-          rm -f "$OV_LIBS"/libtbb.12.dylib
-          rm -f "$OV_LIBS"/libtbb.dylib
           rm -f "$OV_LIBS"/libhwloc*
+          # The unversioned symlink is not what anything links against, and a
+          # symlink is one more thing for the bundler to get wrong.
+          rm -f "$OV_LIBS"/libtbb.dylib
+          xattr -cr "$OV_LIBS" || true
+
+          for lib in "$OV_LIBS"/*.dylib; do
+            base=$(basename "$lib")
+            codesign --remove-signature "$lib" || true
+            if codesign --force --sign - "$lib"; then
+              # It signs. Hand PyInstaller an unsigned file anyway: it signs
+              # what it collects, and replacing a signature is what errors.
+              codesign --remove-signature "$lib" || true
+              continue
+            fi
+            echo "::warning::$base cannot be ad-hoc signed; trying Homebrew's"
+            brew install tbb
+            replacement="$(brew --prefix tbb)/lib/$base"
+            if [ ! -f "$replacement" ]; then
+              echo "::error::no replacement for $base, and OpenVINO needs it"
+              exit 1
+            fi
+            cp -f "$replacement" "$lib"
+            xattr -c "$lib" || true
+            codesign --remove-signature "$lib" || true
+          done
+
           echo "Remaining libs:"
-          ls "$OV_LIBS"
+          ls -la "$OV_LIBS"
       - name: Clear PyInstaller cache
         run: rm -rf ~/Library/Application\ Support/pyinstaller
       - name: Build APP
@@ -311,12 +465,17 @@ jobs:
             --hidden-import PySide6.QtQuickWidgets \
             --hidden-import PySide6.QtMultimedia \
             --collect-submodules whisper \
-            --collect-submodules ultralytics \
+            --collect-submodules yolox \
+            --collect-submodules model_hub \
+            --collect-submodules huggingface_hub \
+            --collect-submodules keyring \
+            --copy-metadata keyring \
             --collect-all openvino \
             --collect-data whisper \
-            --collect-data ultralytics \
             --collect-binaries imageio_ffmpeg \
             --hidden-import llm.clip_prefilter \
+            --hidden-import modules.system.smoke_test \
+            --hidden-import psutil \
             --additional-hooks-dir packaging/pyinstaller-hooks \
             --exclude-module nncf \
             --collect-submodules optimum \
@@ -328,10 +487,61 @@ jobs:
             --copy-metadata safetensors \
             --copy-metadata regex \
             main.py
+      # TODO(mac): ad-hoc is not shippable. `--sign -` produces no Developer ID,
+      # so Gatekeeper quarantines the download and the first launch fails with
+      # "VideoHighlighter is damaged and can't be opened" — the README currently
+      # talks the user through clearing the quarantine flag, which is fine for a
+      # free build and not fine for a paid one. Supporting macOS means an Apple
+      # Developer Program identity in secrets, `--options runtime --timestamp`
+      # signing against it, then `xcrun notarytool submit --wait` and
+      # `xcrun stapler staple` on the DMG.
       - name: Ad-hoc sign the app
         run: |
           codesign --force --deep --sign - "dist/VideoHighlighter.app"
           codesign --verify --verbose "dist/VideoHighlighter.app"
+      - name: Smoke-test the app
+        # Nobody on the project has a Mac, and the first mac build a tester ran
+        # filled his memory until the machine had to be restarted: every
+        # multiprocessing child loaded the whole app. This runs the signed .app
+        # without a window — imports, a spawned child, object detection's
+        # workers, the thumbnail decoder — under a memory ceiling that kills the
+        # process tree rather than the runner. modules/system/smoke_test.py has
+        # the checks. A failure stops the release.
+        #
+        # The clips are generated, never real footage: what is measured is how
+        # many processes start and what each loads, and that does not depend on
+        # what is in the frame. Two codecs because they take different decode
+        # paths — H.264 through videotoolbox, and 1080p ProRes in a .mov, which
+        # is what the tester was editing when the memory ran out.
+        timeout-minutes: 30
+        run: |
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i testsrc2=size=1280x720:rate=30 \
+            -f lavfi -i sine=frequency=440:sample_rate=48000 \
+            -t 30 -c:v libx264 -pix_fmt yuv420p -c:a aac smoke-h264.mp4
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i testsrc2=size=1920x1080:rate=25 \
+            -f lavfi -i sine=frequency=440:sample_rate=48000 \
+            -t 30 -c:v prores_ks -profile:v 2 -c:a pcm_s16le smoke-prores.mov
+          status=0
+          for clip in smoke-h264.mp4 smoke-prores.mov; do
+            echo "::group::smoke test on $clip"
+            "dist/VideoHighlighter.app/Contents/MacOS/VideoHighlighter" \
+              --smoke-test "$PWD/$clip" \
+              --smoke-report "$PWD/smoke-report-${clip%.*}.json" || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+      - name: Upload smoke-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-smoke-test
+          path: |
+            smoke-report-*.json
+            ~/Library/Application Support/VideoHighlighter/*.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Create DMG
         run: |
           create-dmg \
@@ -346,6 +556,7 @@ jobs:
         with:
           name: mac-build
           path: VideoHighlighter-${{ needs.version.outputs.slug }}.dmg
+          retention-days: 7
 
   bootstrap:
     needs: version
@@ -360,12 +571,16 @@ jobs:
           python tools/build_bootstrap_zip.py \
             --edition free \
             --tag "${{ needs.version.outputs.slug }}" \
-            --out packaging/bootstrap/VideoHighlighter-Windows-Setup.zip
+            --out packaging/bootstrap/00-VideoHighlighter-Windows-Setup.zip
       - name: Upload bootstrap artifact
         uses: actions/upload-artifact@v4
         with:
           name: bootstrap-zip
-          path: packaging/bootstrap/VideoHighlighter-Windows-Setup.zip
+          # Leading 00- so GitHub's alphabetical Assets list puts the installer
+          # first. Without it, Setup.zip sank below the multi-GB .7z parts and
+          # the .dmg, and people clicked the wrong file.
+          path: packaging/bootstrap/00-VideoHighlighter-Windows-Setup.zip
+          retention-days: 7
 
   release:
     # `version` must be listed even though no build step needs its output
@@ -385,24 +600,34 @@ jobs:
           name: VideoHighlighter ${{ needs.version.outputs.slug }}
           draft: true
           body: |
-            ## Windows — recommended
+            ## Download
 
-            Download **`VideoHighlighter-Windows-Setup.zip`** (first asset below),
-            extract it anywhere, and double-click **`Install-VideoHighlighter.bat`**.
-            The script fetches both archive parts and unpacks them automatically.
+            ### [Install VideoHighlighter for Windows](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/00-VideoHighlighter-Windows-Setup.exe)
 
-            **Manual:** grab both `VideoHighlighter-Windows-*.7z.001` and `.002`,
-            same folder, extract the `.001` with 7-Zip.
+            One file. Run it, click through, done — it fetches and unpacks
+            everything else itself. Installs per user, no admin rights needed.
 
-            ## Windows — web UI (portable)
+            |  | Installer | Portable |
+            |---|---|---|
+            | Windows (desktop app) | [Setup .exe](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/00-VideoHighlighter-Windows-Setup.exe) | [.7z part 1](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z.001) + [part 2](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z.002) |
+            | Windows (web UI) | — | [.7z part 1](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-Web-Windows-${{ needs.version.outputs.slug }}.7z.001) + [part 2](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-Web-Windows-${{ needs.version.outputs.slug }}.7z.002) |
+            | macOS | — | [.dmg](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-${{ needs.version.outputs.slug }}.dmg) |
 
-            `VideoHighlighter-Web-Windows-*.7z.001` and `.002` are the Tauri shell
-            around the React frontend, with the Python engine bundled. Same folder,
-            extract the `.001` with 7-Zip, then run the app — no installer, because
-            no installer can hold a 1.7 GB sidecar.
+            The installer is not signed yet, so Windows SmartScreen shows
+            "Windows protected your PC" on first run — **More info → Run anyway**.
 
-            **macOS:** `.dmg` only.
-          artifacts: "windows-build/*,web-windows-build/*,mac-build/*,bootstrap-zip/*"
+            The portable downloads are **split archives**: every `.7z.0NN` part
+            listed under Assets must sit in the same folder, then extract the
+            `.001` with 7-Zip. Downloading one part alone fails. The installer
+            above exists so you never have to do that.
+
+            The web UI is the Tauri shell around the React frontend with the
+            Python engine bundled; it has no installer because no installer can
+            hold a 1.7 GB sidecar.
+
+            `00-VideoHighlighter-Windows-Setup.zip` is the older script-based
+            installer, kept as a fallback.
+          artifacts: "windows-installer/*,windows-build/*,web-windows-build/*,mac-build/*,bootstrap-zip/*"
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Say what still has to happen
         # A green run reads as "shipped", and it is not: the release is a draft,

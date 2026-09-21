@@ -10,19 +10,18 @@ import yaml
 import csv
 import cv2
 from tqdm import tqdm
-from ultralytics import YOLO
-
 from action_recognition import run_action_detection, load_models
 from object_recognition import run_object_detection_single
 # modules
-from modules.audio_peaks import extract_audio_peaks
-from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
-from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
-from modules.video_cutter import cut_video
-from modules.auto_segments import build_auto_segments
-from modules.highlight_select import peak_confidence_by_sec, select_fixed_window_segments
-from modules.device_utils import resolve_yolo_device
-from modules.app_paths import ffmpeg_exe
+from modules.audio.audio_peaks import extract_audio_peaks
+from modules.segments.motion_scene_detect_optimized import detect_scenes_motion_optimized
+from modules.media.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
+from modules.media.video_cutter import cut_video
+from modules.segments.auto_segments import build_auto_segments
+from modules.segments.highlight_select import peak_confidence_by_sec, select_fixed_window_segments
+from modules.system.device_utils import resolve_yolo_device
+from modules.system.app_paths import ffmpeg_exe
+from modules.media import ffmpeg_tools
 
 
 # Emitted when detection is skipped because cached results were reused. The
@@ -50,8 +49,8 @@ class ProgressTracker:
 
 # Transcript modules (optional)
 try:
-    from modules.transcript import get_transcript_segments, search_transcript_for_keywords
-    from modules.transcript_srt import create_highlight_subtitles, create_enhanced_transcript, create_srt_file, translate_segments
+    from modules.audio.transcript import get_transcript_segments, search_transcript_for_keywords
+    from modules.audio.transcript_srt import create_highlight_subtitles, create_enhanced_transcript, create_srt_file, translate_segments
     TRANSCRIPT_AVAILABLE = True
 except ImportError:
     TRANSCRIPT_AVAILABLE = False
@@ -63,102 +62,21 @@ def seconds_to_mmss(sec):
     return f"{minutes:02d}:{seconds:02d}"
 
 def get_video_duration(video_path, log_fn=print):
-    """Robust duration via ffprobe. cv2's frame_count/fps is unreliable on VFR
-    or mis-tagged files and can read 2× on a re-open. Falls back to cv2."""
+    """Robust duration from the container (ffprobe, or PyAV without one). cv2's
+    frame_count/fps is unreliable on VFR or mis-tagged files and can read 2× on
+    a re-open. Falls back to cv2."""
     try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        d = float(out)
+        d = float((ffmpeg_tools.probe(video_path).get("format") or {}).get("duration") or 0)
         if d > 0:
             return d
     except Exception as e:
-        log_fn(f"⚠️ ffprobe duration failed ({e}); using cv2 fallback")
+        log_fn(f"⚠️ Duration probe failed ({e}); using cv2 fallback")
     cap = cv2.VideoCapture(video_path)
     fps_ = cap.get(cv2.CAP_PROP_FPS) or 25.0
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     cap.release()
     return n / fps_ if fps_ else 0.0
 
-
-def run_keypoint_detection(video_path, model_path, keypoint_names, frame_skip=5,
-                           confidence_threshold=0.25, log=print, cancel_flag=None,
-                           progress_fn=None):
-    """Run a custom YOLO-pose model over a video and turn each detected keypoint
-    into (a) a per-second object detection and (b) an overlay bbox entry — so the
-    custom model's points feed the same scoring + overlay paths as object
-    detection.
-
-    Returns (object_detections {sec: [names]}, object_bboxes [{timestamp, objects,
-    bboxes (normalised x,y,w,h), confidences}]).
-    """
-    from ultralytics import YOLO
-    model = YOLO(str(model_path))
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        log(f"❌ Could not open video for keypoint detection: {video_path}")
-        return {}, []
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    total_seconds = max(1, int(total_frames / fps)) if fps else 1
-    box = 0.05  # overlay marker size as a fraction of the frame
-    detections, bboxes = {}, []
-    fi = 0
-    step = max(1, int(frame_skip))
-    last_reported = -1
-    if progress_fn:
-        progress_fn(0, total_seconds, "Object Detection", "Custom keypoints: starting…")
-    while True:
-        if cancel_flag is not None and cancel_flag.is_set():
-            break
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if fi % step == 0:
-            sec_now = int(fi / fps) if fps else 0
-            if progress_fn and sec_now != last_reported:
-                last_reported = sec_now
-                progress_fn(sec_now, total_seconds, "Object Detection",
-                            f"Custom keypoints: {sec_now}/{total_seconds}s")
-            try:
-                r = model(frame, conf=confidence_threshold, verbose=False)[0]
-            except Exception as e:
-                log(f"⚠️ keypoint inference failed at frame {fi}: {e}")
-                fi += 1
-                continue
-            if r.keypoints is not None and r.keypoints.xy is not None:
-                kxy = r.keypoints.xy.cpu().numpy()                      # (inst, kp, 2)
-                kconf = (r.keypoints.conf.cpu().numpy()
-                         if r.keypoints.conf is not None else None)     # (inst, kp)
-                ts = fi / fps
-                sec = int(ts)
-                for inst in range(kxy.shape[0]):
-                    for ki, name in enumerate(keypoint_names):
-                        if ki >= kxy.shape[1]:
-                            break
-                        x, y = float(kxy[inst, ki, 0]), float(kxy[inst, ki, 1])
-                        if x <= 0 and y <= 0:
-                            continue   # keypoint not present this instance
-                        c = float(kconf[inst, ki]) if kconf is not None else 1.0
-                        if c < confidence_threshold:
-                            continue
-                        detections.setdefault(sec, set()).add(name)
-                        bboxes.append({
-                            'timestamp': float(ts),
-                            'objects': [name],
-                            'bboxes': [[max(0.0, x / W - box / 2),
-                                        max(0.0, y / H - box / 2), box, box]],
-                            'confidences': [c],
-                        })
-        fi += 1
-    cap.release()
-    if progress_fn:
-        progress_fn(total_seconds, total_seconds, "Object Detection", "Custom keypoints: done")
-    return {s: sorted(v) for s, v in detections.items()}, bboxes
 
 def _collapse_runs(items, fmt="{val} ×{n}", sep=", "):
     """['a','a','a','b','b'] -> 'a ×3, b ×2' (collapses CONSECUTIVE repeats)."""
@@ -204,7 +122,7 @@ def check_cancellation(cancel_flag, log_fn, step_name="operation"):
 def _face_label_counts(face_seconds):
     """How many readable seconds each expression accounted for."""
     try:
-        from modules.face_scan import label_counts
+        from modules.vision.face_scan import label_counts
         return {k: v for k, v in label_counts(face_seconds).items() if v}
     except Exception:
         return {}
@@ -212,7 +130,7 @@ def _face_label_counts(face_seconds):
 
 def check_gpu_availability(log_fn=print):
     """Legacy shim — the single source of truth is device_utils.detect_best_device()."""
-    from modules.device_utils import detect_best_device
+    from modules.system.device_utils import detect_best_device
     d = detect_best_device(log_fn=log_fn)
     return d.gpu_available, d.yolo_pt_device   # ("cuda:0" | "cpu")
 
@@ -349,6 +267,27 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
 
     return analysis_data
 
+# action_backend -> (enable_r3d, r3d_half, r3d_device, r3d_onnx_dml) for the
+# choices that name a backend outright. "auto" is not here: it probes the
+# machine, so it lives at the call site with the detection it depends on.
+#
+# r3d_device is set explicitly so each label means what it says on every
+# machine. Without it the device came from whatever was detected, and
+# "R3D + CPU (PyTorch, slow)" would quietly become DirectML on an AMD box.
+#
+# r3d_dml asks for torch's "cpu" on purpose: the weights are exported once and
+# the forward pass leaves torch for an ONNX Runtime session on the DirectML
+# provider, which is the only way the packaged build reaches a DX12 card --
+# torch-directml cannot be bundled. Until now this was reachable only as a side
+# effect of the Compute setting, never as a request.
+ACTION_BACKEND_SETTINGS = {
+    "openvino": (False, False, None, False),
+    "r3d_cuda": (True, True, "cuda", False),    # FP16 on CUDA
+    "r3d_cpu": (True, False, "cpu", False),     # FP32 on CPU
+    "r3d_dml": (True, False, "cpu", True),      # fp16 is uneven on DirectML
+}
+
+
 def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log_fn=print, progress_fn=None, cancel_flag=None,
                     preview_fn=None, timeline_fn=None):
@@ -370,6 +309,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         str (single output path) or list of tuples [(input_path, output_path), ...]
     """
     
+    # Before anything runs a bare "ffmpeg" — Whisper's audio loader included.
+    ffmpeg_tools.ensure_ffmpeg_on_path(log_fn)
+
     # ========== MULTI-FILE BATCH PROCESSING ==========
     if isinstance(video_path, (list, tuple)):
         results = []
@@ -446,7 +388,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
     try:
         # --- Load config defaults (from config.yaml) ---
         config = {}
-        from modules.app_paths import config_path
+        from modules.system.app_paths import config_path
         cfg_path = config_path("config.yaml")
         if os.path.exists(cfg_path):
             try:
@@ -650,10 +592,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             except (FileNotFoundError, OSError) as e:
                 # ffmpeg missing/unresolvable — would otherwise crash the pipeline
                 # thread uncaught (silent failure in the windowed exe -> empty timeline)
-                log(f"❌ ffmpeg not found for trimming ({e}). Install ffmpeg or ensure "
-                    f"imageio-ffmpeg is bundled. Cannot process time range.")
+                log(f"❌ ffmpeg not found for trimming ({e}). It comes with the app's "
+                    f"requirements (imageio-ffmpeg) — reinstall them. Cannot process time range.")
                 return None
-            except RuntimeError:
+            except RuntimeError as e:
+                # A cancel has already said so (check_cancellation); anything
+                # else would end the run with no reason given.
+                if not (cancel_flag and cancel_flag.is_set()):
+                    log(f"❌ Failed to trim video: {e}")
                 return None
         else:
             log("ℹ️ Processing full video")
@@ -834,8 +780,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     with open(transcript_file, "w", encoding="utf-8") as f:
                         f.write(transcript_text)
                     log(f"✅ Transcript saved: {transcript_file}")
-                except RuntimeError:
-                    return None
+                except RuntimeError as e:
+                    # Cancellation arrives as a RuntimeError and stops the run.
+                    # So did every Whisper and torch failure, unlogged — a video
+                    # then ended as "Failed" with no reason anywhere.
+                    if cancel_flag and cancel_flag.is_set():
+                        return None
+                    log(f"⚠ Transcript processing failed: {e}")
+                    transcript_segments = []
                 except Exception as e:
                     log(f"⚠ Transcript processing failed: {e}")
                     transcript_segments = []
@@ -878,7 +830,13 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         check_cancellation(cancel_flag, log, "transcript phase")
 
-        start_time = time.time()
+        # Not `start_time`: two loops below unpack action sequences into names
+        # of their own, and `start_time, end_time, ... = sequence` overwrote
+        # this one in the same function scope. The run then timed itself from
+        # the last selected sequence's offset (a few seconds into the video)
+        # instead of from now, and reported the whole Unix epoch as its
+        # duration -- "Processing time: 29831566m 49s".
+        run_started_at = time.time()
 
         # --- 1+2 Detect scenes + motion + peaks with live progress ---
         # The gate has to read exactly what the *scoring* will read, or the two
@@ -901,11 +859,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # A cached run can still be missing motion data - the points that gate
         # the detector are scoring weights and deliberately outside the cache
         # signature, so a cache written while they were zero holds empty lists
-        # forever. `modules.analysis_plan` owns that reasoning and the registry
+        # forever. `modules.report.analysis_plan` owns that reasoning and the registry
         # of which settings do this; see its docstring for why it is a module
         # rather than a condition written out here for the third time.
-        from modules.analysis_plan import describe as _describe_backfill
-        from modules.analysis_plan import gate_is_open, needs_backfill
+        from modules.report.analysis_plan import describe as _describe_backfill
+        from modules.report.analysis_plan import gate_is_open, needs_backfill
         motion_wanted = gate_is_open(effective_points, "motion")
         motion_backfill = needs_backfill(
             "motion", effective_points, using_cache=using_cache,
@@ -1024,7 +982,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             # If waveform wasn't cached in older runs, compute it now (cheap) so timeline works
             if waveform_data is None:
                 try:
-                    from modules.audio_peaks import extract_waveform_data
+                    from modules.audio.audio_peaks import extract_waveform_data
                     # Scale resolution with duration so bins stay ~0.25s (tight
                     # waveform/preview alignment) instead of a fixed 1000 points
                     # that become ~1.4s bins on long videos. Capped for draw perf.
@@ -1040,7 +998,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
             # Always try to compute waveform for the timeline viewer
             try:
-                from modules.audio_peaks import extract_waveform_data
+                from modules.audio.audio_peaks import extract_waveform_data
                 # Scale resolution with duration so bins stay ~0.25s (tight
                 # waveform/preview alignment) instead of a fixed 1000 points that
                 # become ~1.4s bins on long videos. Capped for scene-draw perf.
@@ -1073,14 +1031,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # answer different questions: that one thresholds at a fixed -20 dBFS,
         # which is a property of the mastering rather than of the content, and on
         # two files mastered 17 dB apart it cannot describe both. A z-score
-        # against a rolling median can. See modules/loudness_bursts.py.
+        # against a rolling median can. See modules/audio/loudness_bursts.py.
         LOUDNESS_BURST_POINTS = gui_config.get(
             "loudness_burst_points",
             config.get("scoring", {}).get("loudness_burst_points", 0))
         loudness_bursts = []
         # Per-second dBFS, kept because the report compares the level measured
         # during each labelled class and that needs a value for every second,
-        # not only the ones that stood out. See modules/level_by_class.py.
+        # not only the ones that stood out. See modules/audio/level_by_class.py.
         loudness_levels = []
         if LOUDNESS_BURST_POINTS:
             _cached_blob = cached_data if "cached_data" in locals() else None
@@ -1100,7 +1058,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log("🔹 Step 3b: Finding loudness bursts...")
                 try:
                     check_cancellation(cancel_flag, log, "loudness burst detection")
-                    from modules import loudness_bursts as _lb
+                    from modules.audio import loudness_bursts as _lb
                     _lb_cfg = config.get("loudness_bursts", {}) or {}
                     _lb_result = _lb.detect(
                         processed_video_path,
@@ -1162,21 +1120,24 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # Get list of objects to highlight from GUI or config
         highlight_objects = gui_config.get("highlight_objects", config.get("highlight_objects", []))
 
+        # Advanced tab: standard -> the stock detector, custom -> the user's own
+        # model alone, custom_mixed -> both. Key names predate the YOLOX switch
+        # and are kept so saved configs and the web UI keep working.
+        yolo_type = str(gui_config.get("yolo_type", "standard"))
         yolo_model_size = str(gui_config.get("yolo_model_size") or "n").lower()
-        openvino_model_folder = gui_config.get(
-            "openvino_model_folder",
-            f"yolo11{yolo_model_size}_openvino_model/"
-        )
-        yolo_pt_path = gui_config.get("yolo_pt_path", f"yolo11{yolo_model_size}.pt")
-
-
-        # Also update the default PT path based on model size
-        default_pt_path = f"yolo11{yolo_model_size}.pt"
-        log(f"🎯 YOLO model size: {yolo_model_size} (using {default_pt_path})")
+        custom_model_path = gui_config.get("yolo_custom_model_path") or ""
+        object_mode = ("custom" if yolo_type == "custom"
+                       else "mixed" if "custom" in yolo_type else "coco")
+        log(f"🎯 Object detector: {object_mode}, size {yolo_model_size}"
+            + (f" (+ {os.path.basename(custom_model_path)})"
+               if custom_model_path and object_mode != "coco" else ""))
 
         # Check OpenVINO devices (best-effort)
         try:
-            from openvino.runtime import Core
+            try:                          # OpenVINO >= 2024 dropped openvino.runtime
+                from openvino import Core
+            except ImportError:
+                from openvino.runtime import Core
             ie = Core()
             log(f"🔹 OpenVINO available devices: {ie.available_devices}")
         except ImportError:
@@ -1184,70 +1145,46 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         except Exception as e:
             log(f"⚠️ OpenVINO device check failed: {e}")
 
-        # Export model to OpenVINO if missing
-        if not os.path.exists(openvino_model_folder):
-            try:
-                check_cancellation(cancel_flag, log, "YOLO model export")
-                log(f"⚠️ OpenVINO folder not found. Exporting YOLO model (requires {default_pt_path})...")
-                
-                # Use the PT path from config, or fall back to default based on model size
-                yolo_pt_path = gui_config.get("yolo_pt_path", default_pt_path)
-                yolo_model_export = YOLO(yolo_pt_path)
-                export_result = yolo_model_export.export(format="openvino")
-                log(f"✅ Model exported to: {export_result}")
-            except RuntimeError:
-                return None
-            except Exception as e:
-                log(f"❌ YOLO export to OpenVINO failed: {e}")
-
-        # Load YOLO model — YOLO-World or Standard YOLO
+        yolo_model = None  # legacy variable name; holds a Detector backend
+        object_class_names = []
         try:
-            check_cancellation(cancel_flag, log, "YOLO model loading")
-            
-            yolo_type = gui_config.get("yolo_type", "standard")
-            
-            if "yolo_world" in yolo_type:
-                # YOLO-World: open-vocabulary detection (no OpenVINO support)
-                from ultralytics import YOLOWorld
-                world_pt = f"yolov8{yolo_model_size}-worldv2.pt"
-                log(f"🌍 Loading YOLO-World model: {world_pt}")
-                yolo_model = YOLOWorld(world_pt)
-                
-                # Set classes from user's object list
-                if highlight_objects:
-                    yolo_model.set_classes(highlight_objects)
-                    log(f"🌍 YOLO-World classes set to: {highlight_objects}")
-                else:
-                    log("⚠️ YOLO-World loaded but no objects specified — nothing will be detected")
-                
-                # Move to GPU if available
-                from modules.device_utils import detect_best_device
-                devices = detect_best_device(log_fn=log)
-                if "cuda" in yolo_device:
-                    yolo_model.to(yolo_device)
-                    yolo_device_for_inference = yolo_device
-                    log(f"✅ YOLO-World loaded on {yolo_device}")
-                else:
-                    yolo_device_for_inference = "cpu"
-                    log(f"✅ YOLO-World loaded on CPU")
-            else:
-                # Standard YOLO11 (supports OpenVINO)
-                from modules.device_utils import detect_best_device, resolve_yolo_device
-                devices = detect_best_device(log_fn=log)
-                if devices.use_openvino_yolo:
-                    yolo_model = YOLO(openvino_model_folder, task="detect")
-                    yolo_device_for_inference = "cpu"
-                    log(f"✅ YOLO OpenVINO model loaded (OpenVINO manages device)")
-                else:
-                    yolo_model = YOLO(yolo_pt_path)
-                    yolo_model.to(devices.yolo_pt_device)
-                    yolo_device_for_inference = devices.yolo_pt_device
-                    log(f"✅ YOLO .pt model loaded on {yolo_device_for_inference}")
+            check_cancellation(cancel_flag, log, "object detector loading")
+            from modules.vision.detection_backend import build_object_detector
 
+            if "yolo_world" in yolo_type:
+                log("⚠️ Open-vocabulary detection is no longer part of this "
+                    "detector — using the standard one")
+            if object_mode != "coco" and custom_model_path.lower().endswith(".pt"):
+                log(f"⚠️ {os.path.basename(custom_model_path)} is a .pt model, "
+                    "which this detector cannot load. Export it to ONNX, or "
+                    "train a model of your own in the app.")
+            prefer = "small" if yolo_model_size in ("n", "nano", "tiny") else "large"
+            if object_mode == "coco":
+                # AMD / NVIDIA: OpenVINO would run this on the processor, while
+                # ONNX Runtime's DirectML provider reaches the card.
+                from modules.system.device_utils import detect_best_device
+                if getattr(detect_best_device(log_fn=log), "onnx_dml_yolo", False):
+                    from object_recognition import directml_detector
+                    yolo_model = directml_detector(prefer, log=log)
+                    if yolo_model is not None:
+                        from modules.vision.detection_backend import load_class_names
+                        object_class_names = load_class_names("yolo_objects_labels.json")
+            if yolo_model is None:
+                yolo_model, object_class_names = build_object_detector(
+                    mode=object_mode, custom_model_xml=custom_model_path,
+                    device="AUTO", default_prefer=prefer,
+                    log=log, auto_install=True,
+                )
+            if yolo_model is None:
+                log("⚠️ Object detection unavailable — no usable model "
+                    "(run tools/get_yolox_model.py, or import a custom model)")
+            else:
+                log(f"✅ Object detector: {type(yolo_model).__name__}, "
+                    f"{len(object_class_names)} classes")
         except RuntimeError:
             return None
         except Exception as e:
-            log(f"❌ Failed to load YOLO model: {e}")
+            log(f"❌ Failed to load object detector: {e}")
             yolo_model = None
 
         # --- Object detection ---
@@ -1276,51 +1213,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             else:
                 frame_skip_for_obj = gui_config.get("object_frame_skip", CLIP_TIME if CLIP_TIME > 0 else 5)
                 object_detections, object_bboxes_cache = {}, []
-                custom_only = (yolo_type == "custom")
-                use_custom = "custom" in yolo_type
-
-                # --- Custom model (object detector OR keypoint model) ---
-                if use_custom:
-                    cm = gui_config.get("yolo_custom_model_path")
-                    if cm and os.path.exists(cm):
-                        from ultralytics import YOLO as _YOLO
-                        custom_model = _YOLO(str(cm))
-                        c_conf = float(gui_config.get("object_confidence", 0.3))
-                        if getattr(custom_model, "task", "") == "detect":
-                            # Custom object detector -> standard object detection path
-                            want = highlight_objects or list(custom_model.names.values())
-                            log(f"🧩 Custom object detector: {os.path.basename(cm)} {want}")
-                            c_det, c_bb = run_object_detection_single(
-                                processed_video_path, custom_model, want,
-                                log_fn=log_fn, progress_fn=progress_fn,
-                                frame_skip=frame_skip_for_obj, cancel_flag=cancel_flag,
-                                device=yolo_device, confidence_threshold=c_conf,
-                                preview_fn=preview_fn,
-                            )
-                        else:
-                            # Custom keypoint/pose model -> keypoint path
-                            try:
-                                from modules.app_paths import custom_keypoint_names
-                                kp_names = custom_keypoint_names() or highlight_objects
-                            except Exception:
-                                kp_names = highlight_objects
-                            log(f"🧩 Custom keypoint model: {os.path.basename(cm)} {kp_names}")
-                            c_det, c_bb = run_keypoint_detection(
-                                processed_video_path, cm, kp_names,
-                                frame_skip=frame_skip_for_obj, confidence_threshold=c_conf,
-                                log=log, cancel_flag=cancel_flag, progress_fn=progress_fn,
-                            )
-                        for sec, names in c_det.items():
-                            object_detections.setdefault(sec, [])
-                            object_detections[sec] = sorted(set(object_detections[sec]) | set(names))
-                        object_bboxes_cache += c_bb
-                        log(f"✅ Custom model: {sum(len(v) for v in c_det.values())} hits "
-                            f"over {len(c_det)} seconds")
-                    else:
-                        log(f"⚠️ Custom model path not found: {cm}")
-
-                # --- Standard / YOLO-World object detection (skipped for custom-only) ---
-                if not custom_only:
+                # Custom and mixed models are already folded into yolo_model
+                if yolo_model is not None:
                     draw_object_boxes = gui_config.get("draw_object_boxes", False)
                     object_annotated_path = None
                     if draw_object_boxes:
@@ -1358,11 +1252,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # already exist, so editing one and re-running must not require the
         # detections to be computed again — it used to, and the symptom was a
         # rule change that silently did nothing on a cached pass. See
-        # modules/compose_events.py; the call is idempotent.
+        # modules/rules/compose_events.py; the call is idempotent.
         try:
-            from modules.app_paths import composition_rules_path
-            from modules.compose_events import apply_rules, write_back
-            from modules.composition_signals import gather, signal_names
+            from modules.system.app_paths import composition_rules_path
+            from modules.rules.compose_events import apply_rules, write_back
+            from modules.rules.composition_signals import gather, signal_names
 
             _rules_path = composition_rules_path()
             _needed = signal_names(_rules_path)
@@ -1483,31 +1377,96 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 action_backend = gui_config.get("action_backend", "auto")
                 r3d_model = gui_config.get("r3d_model", "r3d_18")
 
-                if action_backend == "openvino":
-                    enable_r3d = False
-                    r3d_half = False
-                elif action_backend == "r3d_cuda":
-                    enable_r3d = True
-                    r3d_half = True   # FP16 on CUDA
-                elif action_backend == "r3d_cpu":
-                    enable_r3d = True
-                    r3d_half = False  # FP32 on CPU
+                # r3d_device is passed explicitly so the two "R3D" choices below
+                # mean what their labels say on every machine. Without it the
+                # device came from whatever the machine reported, and "R3D + CPU
+                # (PyTorch, slow)" would quietly become DirectML on an AMD box.
+                r3d_device = None
+                r3d_onnx_dml = False
+
+                # Which OpenVINO device this run may use is decided by the
+                # compute preference, not by OpenVINO's own AUTO. The DirectML
+                # branches of detect_best_device already declare
+                # openvino_device="CPU" -- "there is no OpenVINO GPU here" --
+                # which on AMD is simply true, because the GPU plugin is
+                # Intel-only. load_models asked AUTO regardless and took the
+                # Intel GPU anyway, so on an Arc "Compute: DirectML" put
+                # OpenVINO on the very card ONNX Runtime was driving. Two
+                # threads into the GPU plugin while DirectML held the device
+                # wedged the run for good, in encoder wait, with no error and
+                # no traceback. Detected once here and used by every branch.
+                from modules.system.device_utils import detect_best_device
+                _dev = detect_best_device(log_fn=log)
+                openvino_device = getattr(_dev, "openvino_device", "AUTO") or "AUTO"
+
+                _explicit = ACTION_BACKEND_SETTINGS.get(action_backend)
+                if _explicit is not None:
+                    (enable_r3d, r3d_half, r3d_device,
+                     r3d_onnx_dml) = _explicit
+                    if r3d_onnx_dml:
+                        log("🎯 Action backend → R3D on DirectML through "
+                            "ONNX Runtime; it stays on the CPU if the export or "
+                            "the provider will not run")
                 else:  # "auto"
-                    # Only enable R3D when CUDA is actually present. On Intel/CPU
-                    # systems R3D can only run on CPU (slow), so we disable it and
-                    # let OpenVINO use the Intel GPU (load_models AUTO → GPU).
-                    from modules.device_utils import detect_best_device
-                    _dev = detect_best_device(log_fn=log)
+                    # R3D needs a GPU to be worth it. On Intel it stays off —
+                    # R3D there could only run on the CPU, and OpenVINO on the
+                    # Intel GPU beats that (load_models AUTO → GPU).
+                    #
+                    # AMD is the case that changed. OpenVINO's GPU plugin is
+                    # Intel-only, so on an AMD box the "let OpenVINO have it"
+                    # branch *is* the CPU — there is no faster path being
+                    # protected, and DirectML competes with the processor rather
+                    # than with a GPU. R3D is a 3D CNN and DirectML's coverage
+                    # there is the open question, so this is not taken on faith:
+                    # R3DModelWrapper runs a real forward pass at load and demotes
+                    # itself to the CPU if the backend cannot execute it, leaving
+                    # the machine exactly where it was before.
                     if _dev.pytorch_device == "cuda":
                         enable_r3d = True
                         r3d_half = True
+                        r3d_device = _dev.pytorch_device
                         log(f"🎯 Auto backend → CUDA detected, using R3D ({_dev.backend_name})")
+                    elif _dev.dml_device:
+                        enable_r3d = True
+                        r3d_half = False  # FP16 is uneven on DirectML
+                        r3d_device = _dev.dml_device
+                        # ONNX Runtime gets a turn before the processor does.
+                        # torch-directml refuses a 5D tensor outright --
+                        # nn.Conv3d raises "input must be 4-dimensional", which
+                        # is the whole of R3D -- so the warm-up demotes the
+                        # model. Without this the demotion goes straight to the
+                        # CPU and takes a working card with it, because ONNX
+                        # Runtime's DirectML provider implements the same
+                        # convolution for up to four spatial dimensions and runs
+                        # this model: 20 Conv nodes, all 3D, measured here at
+                        # 27.9 ms a window. Two stacks, one API, different
+                        # operator coverage. _try_onnx() already waits for
+                        # exactly this case and was never given permission.
+                        r3d_onnx_dml = True
+                        log(f"🎯 Auto backend → DirectML detected, using R3D on "
+                            f"{_dev.dml_device} ({_dev.backend_name}); if that "
+                            f"backend cannot run it, ONNX Runtime is tried on "
+                            f"the same card before the CPU")
+                    elif getattr(_dev, "onnx_dml_torch", False):
+                        # Same card, the other runtime. This is the packaged
+                        # build on a DX12 box: torch cannot address the GPU
+                        # because torch-directml cannot be bundled, but ONNX
+                        # Runtime can, so R3D exports itself once and runs
+                        # there. Before this the branch fell through to
+                        # OpenVINO — which on AMD is the processor, since the
+                        # GPU plugin is Intel-only — so R3D was skipped on
+                        # exactly the machines that had a card going unused.
+                        enable_r3d = True
+                        r3d_half = False      # fp16 is uneven on DirectML
+                        r3d_device = "cpu"    # torch's device; the model leaves it
+                        r3d_onnx_dml = True
+                        log(f"🎯 Auto backend → DirectML via ONNX Runtime, using "
+                            f"R3D ({_dev.backend_name}); it stays on the CPU if "
+                            f"the export or the provider will not run")
                     else:
                         enable_r3d = False
                         r3d_half = False
                         log(f"🎯 Auto backend → no CUDA, using OpenVINO on {_dev.backend_name}")
-
-                log(f"🎯 Action backend: {action_backend} | R3D model: {r3d_model} | enable_r3d: {enable_r3d}")
 
                 action_models_selection = gui_config.get("action_models", "mixed") or "mixed"
                 all_action_detections, action_bboxes_cache = run_action_detection(
@@ -1525,8 +1484,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     enable_r3d=enable_r3d,
                     r3d_model_name=r3d_model,
                     r3d_half=r3d_half,
+                    r3d_device=r3d_device,
+                    r3d_onnx_dml=r3d_onnx_dml,
                     action_models=action_models_selection,
                     preview_fn=preview_fn,
+                    device=openvino_device,
                 )
 
                 check_cancellation(cancel_flag, log, "action recognition processing")
@@ -1701,7 +1663,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         if AVOID_ENABLED and AVOID_IDS:
             try:
                 from video_ai_editor.face_identity import FaceIdentityBank
-                from modules.compute_forbidden import compute_forbidden
+                from modules.segments.compute_forbidden import compute_forbidden
                 bank = FaceIdentityBank(db_path=gui_config.get("face_db_path", "./cache/face_db.json"))
                 forbidden_ranges, forbidden_boxes_by_frame = compute_forbidden(
                     processed_video_path, bank, AVOID_IDS, fps,
@@ -1717,7 +1679,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # "skip" regardless of the face-avoid toggle/method, then merged with any
         # face-identity ranges so downstream zeroing/subtraction sees one list.
         try:
-            from modules.manual_avoid import parse_ranges, combine
+            from modules.segments.manual_avoid import parse_ranges, combine
             manual_avoid = parse_ranges(gui_config.get("avoid_manual_ranges", []))
         except Exception as e:
             log(f"⚠️ Manual avoid parse failed — ignoring manual ranges: {e}")
@@ -1833,7 +1795,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # Every second an event spans, not just its peak: a loudness burst is a
         # moment with a duration, and scoring only the peak second would make the
         # clip-builder cut around a single instant of a two-second event.
-        from modules.loudness_bursts import event_seconds as _burst_seconds
+        from modules.audio.loudness_bursts import event_seconds as _burst_seconds
         loudness_burst_set = _burst_seconds(loudness_bursts)
         for sec in loudness_burst_set:
             if 0 <= sec < len(score):
@@ -1918,8 +1880,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         face_seconds = {}
         if FACE_POINTS and FACE_LABELS:
             try:
-                from modules.face_scan import best_by_second, scan_video
-                from modules.face_emotions import to_signal as face_to_signal
+                from modules.vision.face_scan import best_by_second, scan_video
+                from modules.vision.face_emotions import to_signal as face_to_signal
 
                 face_seconds = scan_video(
                     processed_video_path,
@@ -1944,8 +1906,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # after `face_score` is final, so the arithmetic is untouched either way.
         if not face_seconds:
             try:
-                from modules.face_scan import cache_path_for
-                from modules.face_scan import load as load_face_scan
+                from modules.vision.face_scan import cache_path_for
+                from modules.vision.face_scan import load as load_face_scan
                 _cached = load_face_scan(cache_path_for(
                     processed_video_path, gui_config.get("cache_dir", "./cache")))
                 if _cached:
@@ -2110,7 +2072,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # penalizes and never crashes the run.
         if QUALITY_GATE and segments:
             try:
-                from modules.clip_quality import sample_sharpness, is_blurry
+                from modules.segments.clip_quality import sample_sharpness, is_blurry
 
                 penalized = 0
                 for seg_start, seg_end in segments:
@@ -2148,7 +2110,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # describes the cut that is actually produced.
         if segments and gui_config.get("write_highlight_report", True):
             try:
-                from modules.highlight_report import build_report, write_report
+                from modules.report.highlight_report import build_report, write_report
 
                 def _thumb(sec, _path=processed_video_path):
                     """One JPEG per segment peak. Opened per call rather than
@@ -2180,7 +2142,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # cannot slow a run down.
                 chapters = []
                 try:
-                    from modules.chapters import chapters_for_video
+                    from modules.segments.chapters import chapters_for_video
                     chapters = chapters_for_video(video_path, scenes,
                                                   video_duration, log_fn=print)
                 except Exception as _ce:
@@ -2293,7 +2255,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # Order, interval, and the questions this run cannot answer.
                 # Before the advisor, which reads what this attaches.
                 try:
-                    from modules.sequence_findings import attach as _seq_attach
+                    from modules.report.sequence_findings import attach as _seq_attach
                     _seq_attach(report)
                 except Exception as _fe:
                     print(f"⚠️ Sequence findings skipped: {_fe}")
@@ -2301,7 +2263,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # Diagnose the run before writing it out, so the page and the
                 # JSON carry the same findings and neither can drift.
                 try:
-                    from modules.highlight_advice import attach_advice
+                    from modules.report.highlight_advice import attach_advice
                     attach_advice(report)
                     if report.get("advice"):
                         log(f"💡 {len(report['advice'])} suggestion(s) in the "
@@ -2312,12 +2274,34 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 base = os.path.splitext(OUTPUT_FILE)[0] if OUTPUT_FILE else \
                     os.path.splitext(video_path)[0]
                 html_path = f"{base}_why.html"
-                write_report(report, html_path, json_path=f"{base}_why.json")
+                write_report(report, html_path, json_path=f"{base}_why.json",
+                             serve_base=gui_config.get("report_serve_base"),
+                             media_base=gui_config.get("report_media_base"))
                 log(f"📄 Why-these-moments report: {os.path.basename(html_path)}")
                 # The same breakdown into the debug log, from the same dict, so
                 # the two can never disagree about what happened.
-                from modules.highlight_report import render_text
+                from modules.report.highlight_report import render_text
                 print("\n" + render_text(report))
+
+                # Narrate what was just written, if the run asked for it. Here
+                # rather than on the button it used to live behind: this is a
+                # worker thread, so the several minutes it costs are minutes the
+                # window stays alive and cancellable, where the menu path ran it
+                # on the GUI thread and froze everything until it finished.
+                #
+                # After `write_report` and reading the file back, not before and
+                # not from `report`, because both passes re-render the page from
+                # the record they update — the page and the JSON must not be
+                # able to disagree about what the model said.
+                try:
+                    from modules.narration.story_run import narrate_report_file
+
+                    narrate_report_file(
+                        f"{base}_why.json", config=gui_config, log_fn=log,
+                        cancel_fn=(lambda: bool(cancel_flag
+                                                and cancel_flag.is_set())))
+                except Exception as _ne:
+                    log(f"⚠️ Narration skipped: {_ne}")
             except Exception as _re:
                 log(f"⚠️ Highlight report skipped: {_re}")
 
@@ -2609,7 +2593,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                               "gpu": "GPU re-encode"}[RENDER_MODE]
         log(f"🔹 Step 7: Cutting video segments... [{_render_mode_label}]")
         try:
-            from modules.clip_export import (
+            from modules.media.clip_export import (
                 clips_directory, sanitize_base_name, segment_clip_path,
             )
             import re
@@ -2706,7 +2690,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # never killing a run that already produced a video.
                 if MUSIC_PATH and OUTPUT_FILE and os.path.exists(OUTPUT_FILE):
                     try:
-                        from modules.music_track import apply_music
+                        from modules.media.music_track import apply_music
 
                         music_root, music_ext = os.path.splitext(OUTPUT_FILE)
                         music_tmp = f"{music_root}_music{music_ext or '.mp4'}"
@@ -2796,8 +2780,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         progress.update_progress(100, 100, "Pipeline", "Complete!")
 
         # End timer
-        end_time = time.time()
-        elapsed = end_time - start_time
+        elapsed = time.time() - run_started_at
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
         log(f"⏱️ Processing time: {minutes}m {seconds}s")

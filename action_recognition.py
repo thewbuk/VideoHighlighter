@@ -9,9 +9,9 @@ import queue
 import time
 import argparse
 from collections import Counter, deque
-from ultralytics import YOLO
 import concurrent.futures
 import os
+import sys
 import gc
 import re
 
@@ -25,7 +25,7 @@ try:
     import torchvision.models.video as video_models
     import torchvision.transforms as transforms
     TORCH_AVAILABLE = True
-    from modules.device_utils import detect_best_device as _detect_device
+    from modules.system.device_utils import detect_best_device as _detect_device
     _devices = _detect_device()          # logs GPU info at import time
     CUDA_AVAILABLE = _devices.gpu_available and _devices.pytorch_device == 'cuda'
     _PYTORCH_DEVICE = _devices.pytorch_device  # 'cuda' | 'cpu'
@@ -38,20 +38,26 @@ except ImportError:
 # =============================
 BASE_DIR = Path(__file__).parent.resolve()
 
-# Custom model + mapping files are resolved via data_file() so a packaged exe
-# picks up a copy dropped next to the executable (swap in a retrained model
-# without rebuilding); falls back to the bundled/source copy. From source this
-# is just the project root, so behaviour is unchanged.
+# Bundled data files are resolved via data_file(), so a packaged exe picks up a
+# copy dropped next to the executable; falls back to the bundled/source copy.
+# Trained action models go through action_model_file() instead: they live in
+# models/actions/, where the trainer writes them, with the flat root locations
+# kept as a fallback for models trained before that folder existed.
 try:
-    from modules.app_paths import data_file as _data_file
+    from modules.system.app_paths import data_file as _data_file
+    from modules.system.app_paths import action_model_file as _action_model_file
 except Exception:
     def _data_file(name):
         return str(BASE_DIR / name)
 
-CUSTOM_MAPPING_PATH = Path(_data_file("intel_finetuned_classifier_3d_mapping.json"))
+    def _action_model_file(name):
+        managed = BASE_DIR / "models" / "actions" / name
+        return str(managed if managed.exists() else BASE_DIR / name)
+
+CUSTOM_MAPPING_PATH = Path(_action_model_file("intel_finetuned_classifier_3d_mapping.json"))
 KINETICS_LABELS_PATH = Path(_data_file("kinetics_400_labels.json"))
-R3D_CUSTOM_MAPPING_PATH = Path(_data_file("r3d_finetuned_mapping.json"))
-R3D_CUSTOM_WEIGHTS_PATH = Path(_data_file("r3d_finetuned.pth"))
+R3D_CUSTOM_MAPPING_PATH = Path(_action_model_file("r3d_finetuned_mapping.json"))
+R3D_CUSTOM_WEIGHTS_PATH = Path(_action_model_file("r3d_finetuned.pth"))
 
 
 CUSTOM_LABELS = None
@@ -427,6 +433,86 @@ R3D_IMAGENET_STD = [0.22803, 0.22145, 0.216989]
 # =============================
 # R3D CUDA Model Wrapper
 # =============================
+def _r3d_device_name(wrapper) -> str:
+    """The card R3D actually ran on, for the timing summary.
+
+    Reads it off the wrapper rather than off `CUDA_AVAILABLE`, because the
+    wrapper's device is the only one that reflects what happened: a DirectML
+    load that failed its warm-up has already demoted itself to the CPU, and a
+    summary sourced from the module-level flag would report the device that was
+    *asked for*.
+    """
+    if getattr(wrapper, "onnx", None) is not None:
+        # Checked before `device`, which says "cpu" here: torch is on the
+        # processor precisely because ONNX Runtime took the model to the GPU.
+        return "DirectML (ONNX Runtime)"
+    device = getattr(wrapper, "device", None)
+    if device is None:
+        return "CPU"
+    if device.type == 'cuda':
+        try:
+            return torch.cuda.get_device_name(0)
+        except Exception:  # noqa: BLE001
+            return "CUDA"
+    if _is_directml_device(device):
+        try:
+            from modules.system import directml_device as dml
+            return f"{dml.probe().name() or 'DirectML'} (DirectML)"
+        except Exception:  # noqa: BLE001
+            return "DirectML"
+    return "CPU"
+
+
+def _is_directml_device(device) -> bool:
+    """True if `device` (string or torch.device) names the DirectML backend."""
+    try:
+        from modules.system import directml_device as dml
+        return dml.is_directml(str(device))
+    except Exception:  # noqa: BLE001 — absent module means "no DirectML"
+        return False
+
+
+def _resolve_r3d_device(device_str):
+    """A requested device string -> a torch.device R3D can actually be put on.
+
+    The old form of this was `torch.device(device_str if torch.cuda.is_available()
+    else 'cpu')`, which collapsed *every* non-NVIDIA machine to the processor.
+    That was correct while CUDA was the only accelerator R3D had, and it is the
+    single line that made an AMD card impossible: a DirectML device string
+    handed in here was silently discarded, with nothing logged.
+
+    Never raises — an unusable request becomes the CPU, which is slow rather
+    than broken.
+    """
+    if _is_directml_device(device_str):
+        from modules.system import directml_device as dml
+
+        resolved = dml.normalize(str(device_str))
+        if not resolved:
+            print(f"⚠️ R3D: DirectML requested but unusable "
+                  f"({dml.unavailable_reason()}); using CPU")
+            return torch.device('cpu')
+        try:
+            # The import *is* the backend registration; without it torch does
+            # not know what "privateuseone" means and .to() fails on a string
+            # that looks perfectly valid.
+            import torch_directml  # noqa: F401 — imported for the side effect
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ R3D: torch-directml will not import "
+                  f"({type(e).__name__}: {e}); using CPU")
+            return torch.device('cpu')
+        return torch.device(resolved)
+
+    from modules.system.cuda_check import cuda_usable
+    if str(device_str).startswith('cuda') and not cuda_usable(torch):
+        return torch.device('cpu')
+    try:
+        return torch.device(device_str)
+    except Exception:  # noqa: BLE001 — an unparseable string is not worth a crash
+        print(f"⚠️ R3D: unrecognised device {device_str!r}; using CPU")
+        return torch.device('cpu')
+
+
 class R3DModelWrapper:
     """
     Wraps a torchvision R3D model for use alongside OpenVINO models.
@@ -442,17 +528,29 @@ class R3DModelWrapper:
     """
 
     def __init__(self, model_name='r3d_18', device_str='cuda', half_precision=True,
-                 custom_weights=None, custom_num_classes=None):
+                 custom_weights=None, custom_num_classes=None,
+                 allow_onnx_dml=False):
         """
         Args:
             model_name: One of 'r3d_18', 'mc3_18', 'r2plus1d_18'
-            device_str: 'cuda' or 'cpu'
+            device_str: 'cuda', 'cpu', or a DirectML device ('privateuseone:0')
             half_precision: Use FP16 on CUDA for faster inference
             custom_weights: Path to .pth file with fine-tuned weights (optional)
             custom_num_classes: Number of classes in custom model (required if custom_weights)
+            allow_onnx_dml: May this model move to ONNX Runtime's DirectML
+                provider when torch ends up on the processor? Off by default,
+                and asked rather than inferred: "R3D + CPU (PyTorch, slow)" is a
+                choice a user can make on an AMD box, and it has to keep meaning
+                the CPU there. The caller that knows the difference between that
+                choice and an automatic fallback is the one that decides.
         """
         self.model_name = model_name
-        self.device = torch.device(device_str if torch.cuda.is_available() else 'cpu')
+        self.allow_onnx_dml = bool(allow_onnx_dml)
+        self.device = _resolve_r3d_device(device_str)
+        # FP16 stays CUDA-only. On DirectML half precision is implemented
+        # unevenly per operator, so a 3D CNN that falls back for one layer pays
+        # a conversion on every call instead of saving bandwidth — see
+        # modules/system/directml_device.py and docs/AMD-GPU.md.
         self.half = half_precision and self.device.type == 'cuda'
         self.num_classes = custom_num_classes or 400  # default Kinetics-400
 
@@ -484,10 +582,63 @@ class R3DModelWrapper:
             print(f"   ✓ Loaded custom weights: {custom_num_classes} classes")
 
         self.model.eval()
+        self._place_on_device()
+
+        # Warm-up inference to trigger CUDA kernel compilation — and, on
+        # DirectML, to find out whether this model can run there at all.
+        self._warmup()
+
+        # Last resort before the processor. Asked *after* the warm-up, so a
+        # torch backend that survived it keeps the card it already has.
+        self.onnx = self._try_onnx(custom_weights)
+        print(f"✓ {model_name} loaded and warmed up on {self.backend_label}")
+
+    def _try_onnx(self, custom_weights=None):
+        """An ONNX Runtime session on a DX12 GPU, or None to stay on torch.
+
+        Only ever reached when torch itself ended up on the processor: either
+        this machine has no accelerator torch can address, or the DirectML
+        warm-up above demoted the model. The packaged exe is always in the first
+        case on an AMD box, because `torch-directml` pins an exact torch and so
+        can never be bundled beside the CUDA one — which is the entire reason
+        action recognition was stuck on the processor there.
+
+        Never displaces a working GPU, and never raises: the model this would
+        replace is already loaded and working.
+        """
+        if not self.allow_onnx_dml or self.device.type != 'cpu':
+            return None
+        try:
+            from modules.vision import r3d_onnx
+        except Exception:  # noqa: BLE001 — an absent module means "no ONNX path"
+            return None
+        runner = r3d_onnx.load(self.model, self.model_name, self.num_classes,
+                               custom_weights=custom_weights)
+        if runner is not None:
+            print(f"✅ {self.model_name} on ONNX Runtime via DirectML")
+        return runner
+
+    @property
+    def backend_label(self) -> str:
+        """What is actually about to run the model, for the load line.
+
+        `self.device` alone would say "cpu" on a machine where ONNX Runtime just
+        took the model to the GPU, which is the one case this whole path exists
+        for.
+        """
+        if getattr(self, "onnx", None) is not None:
+            return "DirectML (ONNX Runtime)"
+        return str(self.device)
+
+    def _place_on_device(self):
+        """Move the model and the normalisation constants to self.device.
+
+        Separate from __init__ because it has to be repeatable: the warm-up may
+        decide the chosen device cannot run this model and redo it on the CPU.
+        """
         self.model.to(self.device)
         if self.half:
             self.model.half()
-
 
         # Pre-build normalization tensors on device for speed
         self.mean = torch.tensor(R3D_IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1, 1)
@@ -496,20 +647,53 @@ class R3DModelWrapper:
             self.mean = self.mean.half()
             self.std = self.std.half()
 
-        # Warm-up inference to trigger CUDA kernel compilation
-        self._warmup()
-        print(f"✓ {model_name} loaded and warmed up on {self.device}")
-
     def _warmup(self):
-        """Run a dummy forward pass to warm up CUDA kernels."""
+        """Run a dummy forward pass — and on DirectML, treat it as a test.
+
+        On CUDA this only ever warmed kernels, and a failure was a real fault
+        worth raising. On DirectML it is load-bearing: DirectML implements a
+        *subset* of torch's operators, R3D is a 3D CNN, and 3D convolution is
+        the least certain corner of that subset. The failure would otherwise
+        surface on the first real clip — an hour into a job, as an "operator is
+        not currently implemented" traceback that reads like a bug in the app.
+
+        So the dummy pass is run *at load*, with the real clip shape, and a
+        DirectML failure demotes the model to the CPU instead of propagating.
+        The run is then slow, which is exactly what it was before DirectML
+        existed, and one line says why. Anything not on DirectML still raises,
+        because there a broken warm-up is a fault, not a hardware limit.
+        """
+        try:
+            self._forward_dummy()
+            return
+        except Exception as e:  # noqa: BLE001 — narrowed immediately below
+            if not _is_directml_device(self.device):
+                raise
+            print(f"⚠️ R3D: DirectML cannot run {self.model_name} "
+                  f"({type(e).__name__}: {e})")
+            print("   Falling back to the CPU for action recognition. This is "
+                  "slower but correct; see docs/AMD-GPU.md.")
+
+        self.device = torch.device('cpu')
+        self.half = False
+        self._place_on_device()
+        self._forward_dummy()
+
+    def _forward_dummy(self):
+        """One forward pass at the real clip shape, on whatever self.device is."""
         dummy = torch.zeros(1, 3, R3D_CLIP_LENGTH, R3D_INPUT_SIZE, R3D_INPUT_SIZE,
                             device=self.device)
         if self.half:
             dummy = dummy.half()
         with torch.no_grad():
-            _ = self.model(dummy)
+            out = self.model(dummy)
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
+        # .cpu() forces the queue to drain. DirectML dispatches asynchronously,
+        # so without it a failing operator can raise later, on an unrelated
+        # line, and the fallback above would never see it.
+        return out.cpu()
+
 
     def preprocess_clip(self, raw_frames, roi=None):
         """
@@ -566,6 +750,11 @@ class R3DModelWrapper:
         Returns:
             numpy array of raw logits (400,)
         """
+        if getattr(self, "onnx", None) is not None:
+            # Already on the processor — self.onnx is only ever set when
+            # self.device is the CPU — so this hands over the buffer rather
+            # than copying a tensor off a card.
+            return self.onnx.predict(clip_tensor.cpu().numpy())
         output = self.model(clip_tensor)
         return output.cpu().float().numpy().flatten()
 
@@ -586,6 +775,9 @@ class R3DModelWrapper:
 
     def cleanup(self):
         """Free GPU memory."""
+        if getattr(self, "onnx", None) is not None:
+            self.onnx.close()
+            self.onnx = None
         del self.model
         del self.mean
         del self.std
@@ -634,14 +826,188 @@ class AsyncBatchedInferenceEngine:
         self.requests.clear()
 
 
+
+class _StallWatchdog:
+    """Says what the action loop was doing when it stopped doing it.
+
+    A run that wedges in here leaves nothing behind. The loop waits on other
+    threads and on two GPU runtimes -- the decode thread, OpenVINO's async
+    encoder, ONNX Runtime's DirectML provider -- and a wait that never ends is
+    not an exception: there is no traceback, no exit code, no last line. The
+    progress bar simply stops, and ``debug.log`` ends mid-run on whatever was
+    printed before the loop started.
+
+    So the loop stamps a phase name and a time as it goes, and this thread
+    watches that stamp. When one stops moving it writes the phase, how long it
+    has been stuck, and every thread's Python stack to the log -- which names
+    the blocking call: ``cap.read()`` in the prefetcher, ``session.run`` on
+    DirectML, ``request.wait()`` on OpenVINO. Costs one attribute write per
+    phase and one wakeup a second.
+
+    Python stacks rather than ``faulthandler.dump_traceback``: the frozen build
+    is --windowed, its stderr is a tee with no file descriptor behind it, and
+    faulthandler needs a real one. ``print`` reaches the log; a dump to a
+    descriptor that is not there reaches nobody.
+    """
+
+    def __init__(self, timeout: float = 20.0, repeat: float = 60.0):
+        self.timeout = timeout
+        self.repeat = repeat
+        # One tuple, replaced whole: the watcher reads a consistent pair
+        # without a lock, because the assignment is what CPython makes atomic,
+        # not the two writes it would otherwise take.
+        self._mark = ("starting up", time.monotonic())
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="action-stall-watchdog")
+        self._thread.start()
+
+    def beat(self, phase: str):
+        """Record what the loop is about to do."""
+        self._mark = (phase, time.monotonic())
+
+    def _run(self):
+        reported_at = 0.0
+        while not self._stop.wait(1.0):
+            phase, since = self._mark
+            stuck = time.monotonic() - since
+            if stuck < self.timeout:
+                reported_at = 0.0
+                continue
+            if reported_at and stuck - reported_at < self.repeat:
+                continue
+            reported_at = stuck
+            self._dump(phase, stuck)
+
+    def _dump(self, phase, stuck):
+        import traceback
+        names = {t.ident: t.name for t in threading.enumerate()}
+        print(f"⛔ Action loop stalled: {stuck:.0f}s in '{phase}'. "
+              f"Thread stacks follow (the run is still waiting):", flush=True)
+        for ident, frame in sys._current_frames().items():
+            print(f"--- {names.get(ident, 'thread')} ({ident}) ---")
+            print("".join(traceback.format_stack(frame)).rstrip(), flush=True)
+
+    def close(self):
+        self._stop.set()
+
+
+class _FramePrefetcher:
+    """Decode frames on a background thread into a bounded queue so the main
+    loop never blocks on ``cap.read()``.
+
+    Decoding a file runs at several thousand fps on its own, but inline in the
+    loop that cost is serial with everything else. Off the critical path it
+    overlaps with the async encoder, which is waiting on the GPU anyway, so
+    processing rises toward the inference ceiling. Frame order is preserved;
+    ``read()`` returns ``None`` once the video is exhausted.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, cap, queue_size: int = 8):
+        self.cap = cap
+        self._queue = queue.Queue(maxsize=queue_size)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.is_set():
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            # Block when the consumer is behind, but wake periodically so a
+            # stop() while the queue is full can't wedge this thread.
+            while not self._stop.is_set():
+                try:
+                    self._queue.put(frame, timeout=0.5)
+                    break
+                except queue.Full:
+                    continue
+        try:
+            self._queue.put(self._SENTINEL, timeout=0.5)
+        except queue.Full:
+            pass
+
+    def read(self):
+        """Next frame in order, or ``None`` at end of stream."""
+        while True:
+            try:
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._thread.is_alive():
+                    continue
+                return None
+            return None if item is self._SENTINEL else item
+
+    def stop(self, timeout: float = 10.0) -> bool:
+        """Stop decoding. True when the thread is really gone.
+
+        The join used to give up after a second, and the caller's very next
+        line is ``cap.release()`` -- releasing a capture the decode thread may
+        still be inside. That is a use-after-free in the FFmpeg backend, and it
+        wedges or crashes the process instead of raising. One in-flight
+        ``cap.read()`` is all this normally waits for.
+
+        Draining inside the loop rather than once: the producer can refill a
+        queue emptied a moment ago and go back to blocking on put(), and a
+        single drain before the join leaves it there.
+        """
+        self._stop.set()
+        deadline = time.monotonic() + timeout
+        while self._thread.is_alive() and time.monotonic() < deadline:
+            try:
+                while True:
+                    self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._thread.join(timeout=0.25)
+        return not self._thread.is_alive()
+
+
 # =============================
-# PARALLEL YOLO DETECTOR - OPTIMIZED
+# PARALLEL PERSON DETECTOR - YOLOX (Apache-2.0) BACKED
 # =============================
 class ParallelYOLODetector:
-    """Parallel YOLO detection with frame skipping"""
+    """Parallel person detection with frame skipping, backed by the
+    permissive YOLOX/OpenVINO detector (modules.vision.detection_backend).
 
-    def __init__(self, model_name="yolo11n.pt", num_workers=2, skip_frames=4):
-        self.model = YOLO(model_name)
+    detect_async() feeds frames (every `skip_frames`-th is actually inferred,
+    in a worker thread) and get_latest_detections() returns the last known
+    person boxes, so the AR loop and the live preview never block on detection.
+    """
+
+    PERSON_CONF = 0.40
+
+    def __init__(self, model_name=None, num_workers=2, skip_frames=4,
+                 device="AUTO"):
+        from modules.vision.detection_backend import (
+            YoloxOpenVINODetector, find_default_yolox_ir,
+        )
+        model_xml = model_name or find_default_yolox_ir(prefer="small")
+        if not model_xml and not getattr(sys, "frozen", False):
+            try:
+                from modules.vision import yolox_models
+                print("⬇️ First run: fetching the YOLOX person detector (Apache-2.0)…")
+                yolox_models.install()
+                model_xml = find_default_yolox_ir(prefer="small")
+            except Exception as e:
+                print(f"⚠️ Could not fetch the YOLOX detector: {e}")
+        if not model_xml or not os.path.exists(model_xml):
+            raise FileNotFoundError(
+                f"YOLOX IR not found ({model_xml!r}). "
+                "Run tools/get_yolox_model.py to install one."
+            )
+        # Person-only detector: class 0 in COCO ordering.
+        self.model = YoloxOpenVINODetector(
+            model_xml, class_names=["person"], device=device,
+            score_thr=self.PERSON_CONF,
+        )
+        self.model_xml = model_xml
         self.skip_frames = skip_frames
         self.frame_counter = 0
         self.last_detections = None
@@ -673,18 +1039,22 @@ class ParallelYOLODetector:
 
     def _detect_sync(self, frame):
         try:
-            results = self.model.predict(frame, conf=0.40, classes=[0],
-                                         verbose=False, imgsz=640)
+            h, w = frame.shape[:2]
             boxes = []
-            for r in results:
-                for b in r.boxes:
-                    x1, y1, x2, y2 = map(int, b.xyxy[0])
+            for det in self.model.detect(frame):
+                if det.class_id != 0:  # COCO person
+                    continue
+                x1 = max(0, min(int(det.x1), w - 1))
+                y1 = max(0, min(int(det.y1), h - 1))
+                x2 = max(0, min(int(det.x2), w - 1))
+                y2 = max(0, min(int(det.y2), h - 1))
+                if x2 > x1 and y2 > y1:
                     boxes.append((x1, y1, x2, y2))
             with self.detection_lock:
                 self.last_detections = boxes
             return boxes
         except Exception as e:
-            print(f"YOLO detection error: {e}")
+            print(f"Person detection error: {e}")
             return []
 
     def get_latest_detections(self):
@@ -780,7 +1150,7 @@ def compile_with_fallback(ie, model, preferred_device, model_name="model"):
 
 def load_models(device="AUTO", openvino_threads=None,
                 enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True,
-                action_models='mixed'):
+                action_models='mixed', r3d_device=None, r3d_onnx_dml=False):
     """
     Load models based on action_models selection.
 
@@ -799,8 +1169,18 @@ def load_models(device="AUTO", openvino_threads=None,
     print(f"Available OpenVINO devices: {available_devices}")
 
     if device == "AUTO":
-        device_priority = ["GPU.1", "GPU.0", "GPU", "CPU"]
-        selected_device = next((d for d in device_priority if d in available_devices), "CPU")
+        # OpenVINO's GPU plugin is written for Intel graphics, yet it lists any
+        # OpenCL GPU — an NVIDIA card too. There the action encoder runs three
+        # times slower than on the processor (118 ms vs 40 ms, GTX 1060 against
+        # a Ryzen 5 1400), so AUTO only takes a GPU that is Intel's.
+        def _is_intel_gpu(name):
+            try:
+                return "intel" in str(ie.get_property(name, "FULL_DEVICE_NAME")).lower()
+            except Exception:  # noqa: BLE001 — a device that cannot say is not taken
+                return False
+        device_priority = ["GPU.1", "GPU.0", "GPU"]
+        selected_device = next((d for d in device_priority
+                                if d in available_devices and _is_intel_gpu(d)), "CPU")
     else:
         selected_device = device if device in available_devices else "CPU"
 
@@ -820,12 +1200,33 @@ def load_models(device="AUTO", openvino_threads=None,
         ie, encoder_model, selected_device, model_name="encoder"
     )
     actual_device = encoder_device
+
+    # The decoders stay on the processor while another runtime holds the card.
+    # Two of them on one adapter is contention rather than acceleration -- the
+    # rule device_utils already applies in the other direction, where torch owns
+    # the GPU and R3D is kept off ONNX Runtime (`onnx_dml_torch=False`). Nothing
+    # applied it this way round, and a 0.12.0 run stalled for good inside the
+    # Intel decoder's infer() with R3D running on DirectML on the same Arc A750.
+    # No error, no traceback: an inference that never returns is not an exception.
+    #
+    # It costs nothing to move. Measured on that machine, per sampled window:
+    #
+    #     decoder   GPU 1.14 ms   CPU 0.67 ms   <- the processor is already faster
+    #     encoder   GPU 1.41 ms   CPU 11.41 ms  <- the GPU earns 8x, so it stays
+    #
+    # The decoder is an LSTM over sixteen feature vectors and the round trip costs
+    # more than the arithmetic; the encoder is the one doing work per frame.
+    decoder_device = actual_device
+    if r3d_onnx_dml and actual_device != "CPU":
+        decoder_device = "CPU"
+        print(f"📌 Decoders on CPU: {actual_device} is already running R3D "
+              f"through ONNX Runtime, and the CPU is the faster of the two here")
     if encoder_device != selected_device:
         print(f"📌 Note: Encoder running on {encoder_device} (different from requested {selected_device})")
 
     # Custom decoder is user-swappable: resolve next-to-exe first, else bundled.
-    custom_decoder_xml = Path(_data_file("action_classifier_3d.xml"))
-    custom_decoder_bin = Path(_data_file("action_classifier_3d.bin"))
+    custom_decoder_xml = Path(_action_model_file("action_classifier_3d.xml"))
+    custom_decoder_bin = Path(_action_model_file("action_classifier_3d.bin"))
     intel_decoder_xml  = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
     intel_decoder_bin  = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
 
@@ -848,7 +1249,7 @@ def load_models(device="AUTO", openvino_threads=None,
         print("✓ Loading custom fine-tuned decoder model")
         custom_decoder_model = ie.read_model(model=custom_decoder_xml, weights=custom_decoder_bin)
         compiled_custom_decoder, custom_device = compile_with_fallback(
-            ie, custom_decoder_model, actual_device, model_name="custom decoder"
+            ie, custom_decoder_model, decoder_device, model_name="custom decoder"
         )
         models_info['custom'] = {
             'compiled': compiled_custom_decoder,
@@ -867,7 +1268,7 @@ def load_models(device="AUTO", openvino_threads=None,
         print("✓ Loading Intel Kinetics-400 decoder model")
         intel_decoder_model = ie.read_model(model=intel_decoder_xml, weights=intel_decoder_bin)
         compiled_intel_decoder, intel_device = compile_with_fallback(
-            ie, intel_decoder_model, actual_device, model_name="Intel decoder"
+            ie, intel_decoder_model, decoder_device, model_name="Intel decoder"
         )
         models_info['intel'] = {
             'compiled': compiled_intel_decoder,
@@ -885,20 +1286,29 @@ def load_models(device="AUTO", openvino_threads=None,
     r3d_wrapper = None
     if load_r3d_pre and enable_r3d and TORCH_AVAILABLE:
         try:
-            r3d_device = _PYTORCH_DEVICE
+            # An explicit request wins; otherwise take the machine's own
+            # torch device. That is "cuda" on NVIDIA, a DirectML string on an
+            # AMD box, and "cpu" everywhere else. The caller passes one so that
+            # the "R3D + CPU" backend choice means the CPU on every machine,
+            # rather than quietly becoming DirectML on an AMD one.
+            r3d_device = r3d_device or _PYTORCH_DEVICE
             print(f"🔄 Initializing R3D pretrained model on {r3d_device}...")
             r3d_wrapper = R3DModelWrapper(
                 model_name=r3d_model_name,
                 device_str=r3d_device,
+                allow_onnx_dml=r3d_onnx_dml,
                 half_precision=r3d_half and CUDA_AVAILABLE,
             )
             models_info['cuda'] = {
                 'wrapper': r3d_wrapper,
                 'labels':  KINETICS_400_LABELS,
                 'type':    'pytorch',
-                'device':  r3d_device,
+                # The wrapper's label, not the requested device: it is the only
+                # one that reflects where the model ended up after the warm-up
+                # and the ONNX Runtime attempt.
+                'device':  r3d_wrapper.backend_label,
             }
-            print(f"✅ R3D pretrained loaded on {r3d_device}")
+            print(f"✅ R3D pretrained loaded on {r3d_wrapper.backend_label}")
         except Exception as e:
             print(f"⚠️ Failed to load R3D pretrained model: {e}")
             r3d_wrapper = None
@@ -909,7 +1319,7 @@ def load_models(device="AUTO", openvino_threads=None,
     if load_r3d_custom and enable_r3d and TORCH_AVAILABLE:
         if R3D_CUSTOM_LABELS and R3D_CUSTOM_WEIGHTS_PATH.exists():
             try:
-                r3d_custom_device = 'cuda' if CUDA_AVAILABLE else 'cpu'
+                r3d_custom_device = r3d_device or _PYTORCH_DEVICE
                 custom_variant = (R3D_CUSTOM_META or {}).get('model_variant') or r3d_model_name
                 num_classes = len(R3D_CUSTOM_LABELS)
                 print(f"🔄 Initializing R3D custom model ({num_classes} classes, "
@@ -917,6 +1327,7 @@ def load_models(device="AUTO", openvino_threads=None,
                 r3d_custom_wrapper = R3DModelWrapper(
                     model_name=custom_variant,
                     device_str=r3d_custom_device,
+                    allow_onnx_dml=r3d_onnx_dml,
                     half_precision=r3d_half and CUDA_AVAILABLE,
                     custom_weights=str(R3D_CUSTOM_WEIGHTS_PATH),
                     custom_num_classes=num_classes,
@@ -925,9 +1336,10 @@ def load_models(device="AUTO", openvino_threads=None,
                     'wrapper': r3d_custom_wrapper,
                     'labels':  R3D_CUSTOM_LABELS,
                     'type':    'pytorch',
-                    'device':  r3d_custom_device,
+                    'device':  r3d_custom_wrapper.backend_label,
                 }
-                print(f"✅ R3D custom model loaded on {r3d_custom_device}")
+                print(f"✅ R3D custom model loaded on "
+                      f"{r3d_custom_wrapper.backend_label}")
             except Exception as e:
                 print(f"⚠️ Failed to load R3D custom model: {e}")
         elif R3D_CUSTOM_LABELS and not R3D_CUSTOM_WEIGHTS_PATH.exists():
@@ -1138,7 +1550,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                          warm_up_seconds=2, include_model_type=False,
                          openvino_threads=None, preprocess_workers=2,
                          enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True,
-                         action_models='mixed', preview_fn=None):
+                         action_models='mixed', preview_fn=None,
+                         r3d_device=None, r3d_onnx_dml=False):
     """
     Run action recognition — OPTIMIZED version with R3D/CUDA support.
 
@@ -1210,7 +1623,9 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
      models_info, actual_device, r3d_wrapper) = \
         load_models(device, openvino_threads=openvino_threads,
                     enable_r3d=enable_r3d, r3d_model_name=r3d_model_name,
-                    r3d_half=r3d_half, action_models=action_models)  # ← passed through
+                    r3d_half=r3d_half, action_models=action_models,
+                    r3d_device=r3d_device,  # ← passed through
+                    r3d_onnx_dml=r3d_onnx_dml)
 
     encoder_engine = AsyncBatchedInferenceEngine(
         compiled_encoder, encoder_input, encoder_output, num_requests=num_requests)
@@ -1259,15 +1674,25 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     action_detector = None
 
     if use_person_detection:
-        print(f"🔍 Initializing parallel YOLO with {yolo_workers} workers "
-              f"(skip: {yolo_skip_frames})...")
-        yolo_detector = ParallelYOLODetector(
-            model_name="yolo11n.pt",
-            num_workers=yolo_workers,
-            skip_frames=yolo_skip_frames
-        )
-        person_tracker = PersonTracker(iou_threshold=0.3, max_lost_frames=10)
-        action_detector = SmartActionDetector(sticky_frames=15)
+        try:
+            # Same device the encoder and decoders were given. The detector
+            # is the one OpenVINO consumer that infers from a worker thread, so
+            # leaving it on AUTO put a second thread into the GPU plugin while
+            # the run had already decided OpenVINO was to stay off the card.
+            yolo_detector = ParallelYOLODetector(
+                num_workers=yolo_workers,
+                skip_frames=yolo_skip_frames,
+                device=device,
+            )
+            person_tracker = PersonTracker(iou_threshold=0.3, max_lost_frames=10)
+            action_detector = SmartActionDetector(sticky_frames=15)
+            print(f"🔍 Person detector: YOLOX/OpenVINO "
+                  f"({os.path.basename(yolo_detector.model_xml)}, "
+                  f"{yolo_workers} workers, skip: {yolo_skip_frames})")
+        except FileNotFoundError as e:
+            print(f"⚠️ {e}")
+            print("⚠️ Falling back to full-frame action classification (no person ROIs)")
+            use_person_detection = False
 
     # ---- Open video ----
     cap = cv2.VideoCapture(video_path)
@@ -1291,6 +1716,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     raw_frame_buffer = deque(maxlen=R3D_CLIP_LENGTH) if has_any_r3d else None
 
     try:
+        frame_reader = None  # background decode thread (started before main loop)
+        watchdog = None      # names the phase if the loop stops moving
         if draw_bboxes and annotated_output:
             if frame_height > 1080 and downscale_factor < 1.0:
                 frame_width = int(frame_width * downscale_factor)
@@ -1426,6 +1853,12 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
         # =============================================
         pending_preprocess_future = None
 
+        # Decode ahead on a background thread so the loop never blocks on
+        # cap.read(). The warm-up above already finished its own reads, so
+        # the prefetcher owns the capture from here on.
+        frame_reader = _FramePrefetcher(cap).start()
+        watchdog = _StallWatchdog()
+
         with open(log_file, mode="w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["timestamp_mmss", "frame_id", "action_id", "action_name",
@@ -1443,8 +1876,9 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     print("⚠️ Action detection canceled by user.")
                     break
 
-                ret, frame = cap.read()
-                if not ret:
+                watchdog.beat('waiting for a decoded frame')
+                frame = frame_reader.read()
+                if frame is None:
                     break
 
                 frame_id += 1
@@ -1454,6 +1888,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
                 # ---- Person detection ----
                 if use_person_detection and yolo_detector:
+                    watchdog.beat('person detection (YOLOX)')
                     yolo_start = time.time()
                     h, w = frame.shape[:2]
                     if h > 1080 or w > 1920:
@@ -1509,6 +1944,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
                 # ── Live detection preview (boxes already burned into the frame) ──
                 if preview_fn is not None:
+                    watchdog.beat('live preview frame')
                     now = time.time()
                     if now - _last_preview_t >= 0.12:
                         _last_preview_t = now
@@ -1544,6 +1980,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     # --- PIPELINE: collect previous preprocess result ---
                     if pending_preprocess_future is not None:
                         preprocess_start = time.time()
+                        watchdog.beat('preprocess (worker thread)')
                         processed_frame = pending_preprocess_future.result()
                         preprocess_time += time.time() - preprocess_start
                     else:
@@ -1566,6 +2003,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
                     # ---- Process PREVIOUS request's results ----
                     if prev_req is not None and len(sequence_buffer) >= SEQUENCE_LENGTH:
+                        watchdog.beat(f'encoder wait ({_backend_label})')
                         features = encoder_engine.wait_and_get(prev_req)[0]
                         features = np.reshape(features, (-1,))
                         sequence_buffer.append(features.copy())
@@ -1593,6 +2031,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             if (raw_frame_buffer is not None
                                     and len(raw_frame_buffer) == R3D_CLIP_LENGTH):
                                 r3d_start = time.time()
+                                watchdog.beat('R3D inference')
                                 r3d_roi = current_action_roi if use_person_detection else None
                                 frames_list = list(raw_frame_buffer)
 
@@ -1619,6 +2058,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
                                 r3d_time += time.time() - r3d_start
 
+                            watchdog.beat('action decoders')
                             if interesting_actions_set:
                                 # === Targeted: only run decoders needed for mapped actions ===
                                 for key, (action_id, model_type) in action_to_model.items():
@@ -1722,6 +2162,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                             'model_type':  det_model,
                                         })
 
+                    watchdog.beat('logging detections')
                     prev_req = req
                     prev_timestamp_secs = timestamp_secs
                     prev_frame_id = frame_id
@@ -1746,6 +2187,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     last_perf_print = current_time
 
                 if progress_callback and (current_time - last_gui_update > 0.1):
+                    watchdog.beat('progress callback (GUI)')
                     elapsed = current_time - start_time
                     processing_fps = processed_frames / elapsed if elapsed > 0 else 0
                     engine_stats = encoder_engine.get_stats()
@@ -1884,7 +2326,18 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
     finally:
         print("\n🧹 Cleaning up resources...")
-        cap.release()
+        if watchdog is not None:
+            watchdog.close()
+        release_capture = True
+        if frame_reader is not None and not frame_reader.stop():
+            # Never release a capture another thread may still be reading:
+            # leaking one VideoCapture for the rest of the process costs a
+            # handle, while releasing it under a live read takes the run down.
+            print("⚠️ Decode thread would not stop — leaving the "
+                  "capture open rather than releasing it underneath the reader.")
+            release_capture = False
+        if release_capture:
+            cap.release()
         if video_writer:
             video_writer.release()
             print(f"✅ Annotated video saved: {annotated_output}")
@@ -1939,7 +2392,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     print(f"CPU cores:            {os.cpu_count()}")
     print(f"OpenVINO threads:     {openvino_threads}")
     if r3d_wrapper:
-        device_name = torch.cuda.get_device_name(0) if CUDA_AVAILABLE else "CPU"
+        device_name = _r3d_device_name(r3d_wrapper)
         print(f"R3D device:           {device_name}")
     print(f"Actions detected:     {detection_count}")
     print("=" * 60)

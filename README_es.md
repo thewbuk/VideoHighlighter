@@ -69,8 +69,8 @@ Esta versión sigue siendo gratuita y está licenciada bajo AGPL-3.0.
 Descargue la última versión en formato `.exe` desde [Releases](https://github.com/Aseiel/VideoHighlighter/releases); no se requiere Python ni otras dependencias.
 
 ### Linux / Compilación desde el código fuente
-1. **Python & FFmpeg**
-   Es necesario tener instalado FFmpeg y que esté disponible en el PATH de su sistema.
+1. **Python**
+   `pip install -r requirements.txt`: FFmpeg viene incluido (mediante `imageio-ffmpeg`), no hace falta instalarlo aparte. Si ya hay un FFmpeg en el PATH, se usa ese.
 
 ## Uso
 Linux: python main.py 
@@ -86,12 +86,14 @@ De vez en cuando, VideoHighlighter “siente” algo al respecto de tus grabacio
 
 OpenAI Whisper está bajo licencia MIT, por lo que se puede utilizar libremente.
 
-La API de Google Translate es opcional. Si se utilizan bibliotecas no oficiales (como googletrans), no se necesita clave de API, pero los resultados podrían dejar de funcionar si Google modifica sus puntos de conexión.
+La traducción de subtítulos se ejecuta en un LLM local a través de [ollama](https://ollama.com): no interviene ningún servicio de traducción, clave de API ni cuenta, y el texto nunca sale de la máquina. Sin ollama, los subtítulos se escriben en el idioma hablado.
 
 Este proyecto no incluye claves API de pago. Los usuarios deben proporcionar las suyas propias si utilizan servicios oficiales.
 
 
 ## Licencia
+
+Copyright (C) 2026 Przemysław Kreft y Meric Donmezer.
 
 Este repositorio se publica bajo la licencia GNU Affero General Public License v3.0 (AGPLv3). Puede utilizar, modificar y distribuir el código libremente, siempre y cuando cualquier versión modificada, incluidas las ofrecidas a través de una red, haga disponible su código fuente completo bajo la misma licencia.
 

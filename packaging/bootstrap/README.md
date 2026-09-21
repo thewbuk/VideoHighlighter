@@ -69,14 +69,19 @@ python tools/build_bootstrap_zip.py --edition free --write-config
 
 ## Shipping later (separate decision)
 
-When happy:
+The recommended public download is now the Inno Setup installer
+(`00-VideoHighlighter-Windows-Setup.exe`) built in the Windows release job —
+see `packaging/installer/`. This bootstrap zip remains attached as a fallback.
 
-1. CI builds `VideoHighlighter-Windows-Setup.zip` automatically (`tools/build_bootstrap_zip.py`).
-2. Attach that zip as the **first** asset on the Free release page (filename must stay
-   constant so `/releases/latest/download/VideoHighlighter-Windows-Setup.zip` works).
-3. Keep the `.7z.001` / `.7z.002` assets as today — bootstrap just downloads them.
+When using the zip path:
 
-Pro customers use Lemon Squeezy (single `.7z`); see `docs/LS-PRODUCT-SETUP.md` in the Pro repo.
+1. CI still builds `00-VideoHighlighter-Windows-Setup.zip` (`tools/build_bootstrap_zip.py`).
+2. Filename must stay constant so
+   `/releases/latest/download/00-VideoHighlighter-Windows-Setup.zip` works.
+3. Keep the `.7z.001` / `.7z.002` assets — bootstrap downloads them.
+
+Pro customers use Lemon Squeezy (offline Setup.exe); see `docs/LS-PRODUCT-SETUP.md`
+in the Pro repo.
 
 ## Safety
 

@@ -1,7 +1,7 @@
 # PyInstaller spec for the FastAPI sidecar bundled into the Tauri app.
 #
 # The sidecar imports the same engine as main.py (pipeline -> torch/cv2/whisper/
-# ultralytics/openvino), so the collection flags mirror .github/workflows/
+# yolox/openvino), so the collection flags mirror .github/workflows/
 # build-release.yaml. Differences from the Qt build:
 #   * console app, not --windowed: it's a child process, never user-facing, and
 #     its stdout is piped to the Tauri log.
@@ -64,12 +64,11 @@ hiddenimports = [
 ]
 
 hiddenimports += collect_submodules("whisper")
-hiddenimports += collect_submodules("ultralytics")
+hiddenimports += collect_submodules("yolox")
 hiddenimports += collect_submodules("optimum")
 hiddenimports += collect_submodules("transformers")
 
 datas += collect_data_files("whisper")
-datas += collect_data_files("ultralytics")
 datas += collect_data_files("transformers")
 
 # transformers/optimum read their own versions via importlib.metadata at import.
@@ -84,6 +83,19 @@ ov_datas, ov_binaries, ov_hidden = collect_all("openvino")
 datas += ov_datas
 binaries += ov_binaries
 hiddenimports += ov_hidden
+
+# ONNX Runtime, for the DirectML detection path (modules/vision/onnx_detector.py). It
+# is imported inside a function rather than at module scope, and its providers
+# are native libraries, so collect it explicitly rather than trusting the graph.
+# Absent on any platform without the wheel — a sidecar built there simply has
+# no DirectML, which is already what that machine gets.
+try:
+    ort_datas, ort_binaries, ort_hidden = collect_all("onnxruntime")
+    datas += ort_datas
+    binaries += ort_binaries
+    hiddenimports += ort_hidden
+except Exception:
+    pass
 
 # imageio_ffmpeg ships the ffmpeg binary the pipeline falls back to when none is
 # on PATH (see app_paths.ffmpeg_exe).

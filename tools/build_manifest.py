@@ -46,7 +46,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.update_manifest import (  # noqa: E402
+from modules.update.update_manifest import (  # noqa: E402
     MANIFEST_FILENAME,
     MANIFEST_FORMAT,
     SIGNATURE_FILENAME,
@@ -256,4 +256,6 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    from modules.system.debug_console import force_utf8_stdio
+    force_utf8_stdio()
     raise SystemExit(main())

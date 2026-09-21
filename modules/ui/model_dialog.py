@@ -18,7 +18,7 @@ server, so the report asked the user to remember a tag that the machine it was
 about to talk to could simply be asked for. A mistyped tag is indistinguishable
 from one that has not been pulled, and the failure surfaces at the end of a
 generation somebody waited a minute for. Both fields now offer what is already
-there — see :mod:`modules.llm_discovery` — and both stay typable, because a
+there — see :mod:`modules.narration.llm_discovery` — and both stay typable, because a
 model being pulled right now is not a reason to refuse the name.
 
 Where the choices come from is injected rather than imported, so the dialog
@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from modules.llm_models import BACKENDS, label_for
+from modules.narration.llm_models import BACKENDS, label_for
 
 GGUF_FILTER = "GGUF models (*.gguf);;All files (*)"
 
@@ -51,7 +51,7 @@ class ModelDialog(QDialog):
     The three callables are everything that reaches outside this window: what
     the Ollama server holds, which GGUF files have been used before, and putting
     one at the top of that shortlist. They default to
-    :mod:`modules.llm_discovery`; a test passes its own and touches neither the
+    :mod:`modules.narration.llm_discovery`; a test passes its own and touches neither the
     network nor the settings.
     """
 
@@ -59,9 +59,11 @@ class ModelDialog(QDialog):
                  chosen: Optional[str] = None,
                  list_models: Optional[Callable] = None,
                  list_recent: Optional[Callable] = None,
-                 remember: Optional[Callable] = None):
+                 remember: Optional[Callable] = None,
+                 host: Optional[Callable] = None):
         super().__init__(parent)
         self._list_models = list_models or self._default_models
+        self._host = host or self._default_host
         self._list_recent = list_recent or self._default_recent
         self._remember_fn = remember or self._default_remember
         self.setWindowTitle("Models for the report")
@@ -165,17 +167,34 @@ class ModelDialog(QDialog):
     # ------------------------------------------------------------------ #
     @staticmethod
     def _default_models(refresh: bool = False) -> list:
-        from modules.llm_discovery import ollama_models
+        from modules.narration.llm_discovery import ollama_models
         return ollama_models(refresh=refresh)
 
     @staticmethod
+    def _default_host() -> str:
+        """The server the list came from, when that is worth saying.
+
+        Worth saying because the answer is no longer always this machine: with
+        the host pointed at another box, "no server answered" and "that box is
+        switched off" are the same sentence, and only one of them can be acted
+        on. Empty for plain localhost, where the URL is noise the user already
+        knows.
+        """
+        try:
+            from llm.ollama_host import DEFAULT_BASE_URL, resolve
+            url = resolve()
+            return "" if url == DEFAULT_BASE_URL else url
+        except Exception:                          # pragma: no cover - defensive
+            return ""
+
+    @staticmethod
     def _default_recent() -> list:
-        from modules.llm_discovery import recent_gguf
+        from modules.narration.llm_discovery import recent_gguf
         return recent_gguf()
 
     @staticmethod
     def _default_remember(path: str) -> None:
-        from modules.llm_discovery import remember_gguf
+        from modules.narration.llm_discovery import remember_gguf
         remember_gguf(path)
 
     def _fill_tags(self, refresh: bool = False):
@@ -189,10 +208,15 @@ class ModelDialog(QDialog):
         self.tag.clear()
         self.tag.addItems(found)
         self.tag.setCurrentText(typed)
+        try:
+            asked = self._host()
+        except Exception:                          # pragma: no cover - defensive
+            asked = ""
+        where = f" at {asked}" if asked else ""
         self.status.setText(
-            f"{len(found)} model(s) on the Ollama server." if found else
-            "No Ollama server answered — type a name, or start it and press "
-            "Refresh.")
+            f"{len(found)} model(s) on the Ollama server{where}." if found else
+            f"No Ollama server answered{where} — type a name, or start it and "
+            "press Refresh.")
 
     def _refresh_tags(self):
         self._fill_tags(refresh=True)

@@ -68,8 +68,8 @@ VideoHighlighter（免费版）
 从[Releases](https://github.com/Aseiel/VideoHighlighter/releases)下载最新的`.exe`文件——无需安装Python或任何依赖项。
 
 ### Linux / 从源码构建
-1. **Python & FFmpeg**
-   系统中必须已安装 FFmpeg，且其路径需在系统 PATH 中。
+1. **Python**
+   运行 `pip install -r requirements.txt`。FFmpeg 会随之安装（通过 `imageio-ffmpeg`），无需单独安装；如果 PATH 中已有 FFmpeg，则优先使用它。
 
 ## 使用方法
 Linux：python main.py
@@ -85,12 +85,14 @@ VideoHighlighter 有时会对你的视频内容发表“意见”。当它这么
 
 OpenAI Whisper采用MIT许可证，可自由使用。
 
-Google Translate API 是可选的。如果使用非官方库（googletrans），则无需 API 密钥，但若 Google 更改接口地址，功能可能会出现异常。
+字幕翻译通过 [ollama](https://ollama.com) 在本地 LLM 上运行：不涉及任何翻译服务、API 密钥或账户，文本绝不会离开本机。若未安装 ollama，字幕将以原始语言写出。
 
 该项目不包含任何付费 API 密钥。若要使用官方服务，用户需自行提供相关密钥。
 
 
 ## 许可证
+
+版权所有 (C) 2026 Przemysław Kreft、Meric Donmezer。
 
 本仓库遵循 GNU Affero General Public License v3.0（AGPLv3）发布。您可自由使用、修改及分发该代码，前提是所有修改后的版本，包括通过网络提供的版本，都必须以相同许可证公开其完整的源代码。
 

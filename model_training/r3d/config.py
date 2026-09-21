@@ -6,13 +6,23 @@ End-to-end 3D CNN fine-tuning on CUDA (or CPU fallback).
 Input: 112×112, Kinetics-400 normalization.
 """
 
+import os
+
 import torch
+
+# Resolved against the repository, not the working directory: a bare relative
+# name dropped the trained model wherever the run happened to start, which for
+# the GUI's trainer subprocess is the install root. Everything a run produces
+# now lands in models/actions/, beside models/custom/ where the object
+# detectors go, and that is the first place the app looks for it.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_MODELS_DIR = os.path.join(_REPO_ROOT, "models", "actions")
 
 CONFIG = {
     # --- paths ---
     "data_path": "dataset",
-    "model_save_path": "r3d_finetuned.pth",
-    "checkpoint_dir": "checkpoints_r3d",
+    "model_save_path": os.path.join(_MODELS_DIR, "r3d_finetuned.pth"),
+    "checkpoint_dir": os.path.join(_REPO_ROOT, "checkpoints_r3d"),
     "checkpoint_path": None,
 
     # --- model ---
@@ -74,7 +84,7 @@ CONFIG = {
     "smoothing_base_alpha": 0.5,
     "motion_threshold": 2.0,
     "use_pose_guided_crop": True,
-    "pose_model": "yolo11n-pose.pt",
+    "pose_model": None,  # no permissive pose model yet; ROI uses person boxes
     "pose_conf_threshold": 0.3,
     "max_action_people": 2,
 

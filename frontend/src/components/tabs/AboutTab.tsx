@@ -39,6 +39,30 @@ export function AboutTab() {
 
       <Card>
         <CardHeader>
+          <CardTitle className="text-sm font-medium">VideoHighlighter Pro</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2 text-sm">
+          <p>
+            You&apos;re running the free, open-source edition — face identity,
+            expressions, the report and the assistant are all here.{" "}
+            <strong>Pro</strong> teaches the app a vocabulary of its own:
+            categories from your own example frames, search by example,
+            open-vocabulary detection, a live overlay, and a commercial licence.
+          </p>
+          <p>
+            {info ? (
+              <Link href={info.website}>Learn more / Get Pro</Link>
+            ) : (
+              <Link href="https://aseiel.github.io/VideoHighlighter-site/">
+                Learn more / Get Pro
+              </Link>
+            )}
+          </p>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
           <CardTitle className="text-sm font-medium">Contact &amp; Support</CardTitle>
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
